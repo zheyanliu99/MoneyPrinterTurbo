@@ -823,7 +823,23 @@ def combine_videos_by_segments(
             if source_duration <= 0:
                 raise ValueError(f"invalid material duration: {material_path}")
 
-            if source_duration < target_duration:
+            trim_start = max(float(segment.get("trim_start") or 0.0), 0.0)
+            trim_end_value = segment.get("trim_end")
+            trim_end = (
+                float(trim_end_value)
+                if trim_end_value is not None and trim_end_value != ""
+                else source_duration
+            )
+            trim_start = min(trim_start, max(source_duration - 0.1, 0.0))
+            trim_end = min(max(trim_end, trim_start + 0.1), source_duration)
+            trim_duration = max(trim_end - trim_start, 0.1)
+            logger.debug(
+                f"matched segment trim window: {trim_start:.2f}s -> "
+                f"{trim_end:.2f}s, target: {target_duration:.2f}s"
+            )
+            clip = clip.subclipped(trim_start, trim_end)
+
+            if trim_duration < target_duration:
                 clip = clip.with_effects([vfx.Loop(duration=target_duration)])
             else:
                 clip = clip.subclipped(0, target_duration)

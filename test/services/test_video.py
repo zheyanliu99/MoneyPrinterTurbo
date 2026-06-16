@@ -67,6 +67,56 @@ class TestSecurityControls(unittest.TestCase):
             sm.state.delete_task(task_id)
             shutil.rmtree(task_dir, ignore_errors=True)
 
+    def test_task_query_maps_candidate_preview_urls(self):
+        """
+        候选编辑器需要 GET /tasks/{task_id} 返回可播放的 preview_url，
+        同时不能把 URL 回写污染原始任务状态。
+        """
+        task_id = "candidate-url-task"
+        task_dir = utils.task_dir(task_id)
+        candidate_path = os.path.join(task_dir, "candidates", "segment-001", "a.mp4")
+        os.makedirs(os.path.dirname(candidate_path), exist_ok=True)
+        Path(candidate_path).write_bytes(b"fake-video")
+        config.app["endpoint"] = ""
+
+        try:
+            sm.state.update_task(
+                task_id,
+                state=const.TASK_STATE_COMPLETE,
+                matched_segments=[
+                    {
+                        "index": 1,
+                        "material": candidate_path,
+                        "candidates": [
+                            {
+                                "candidate_id": "seg-1-cand-1",
+                                "material": candidate_path,
+                            }
+                        ],
+                    }
+                ],
+                requires_selection=True,
+            )
+
+            response = video_controller.get_task(_FakeRequest(), task_id=task_id)
+            segment = response["data"]["matched_segments"][0]
+
+            self.assertEqual(
+                segment["material_url"],
+                f"/tasks/{task_id}/candidates/segment-001/a.mp4",
+            )
+            self.assertEqual(
+                segment["candidates"][0]["preview_url"],
+                f"/tasks/{task_id}/candidates/segment-001/a.mp4",
+            )
+            self.assertNotIn(
+                "preview_url",
+                sm.state.get_task(task_id)["matched_segments"][0]["candidates"][0],
+            )
+        finally:
+            sm.state.delete_task(task_id)
+            shutil.rmtree(task_dir, ignore_errors=True)
+
     def test_in_memory_task_manager_rejects_when_queue_is_full(self):
         """
         并发数用尽后，等待队列必须有硬上限。这里用 max_concurrent_tasks=0
@@ -318,12 +368,73 @@ class TestVideoService(unittest.TestCase):
                         output_dir=temp_dir,
                     )
 
-        used_codecs = [
-            call.args[0][call.args[0].index("-c:v") + 1]
-            for call in run.call_args_list
-        ]
-        self.assertEqual(used_codecs, ["h264_nvenc", "libx264"])
-        self.assertIn("h264_nvenc", vd._runtime_disabled_video_codecs)
+                    used_codecs = [
+                        call.args[0][call.args[0].index("-c:v") + 1]
+                        for call in run.call_args_list
+                    ]
+                    self.assertEqual(used_codecs, ["h264_nvenc", "libx264"])
+                    self.assertIn("h264_nvenc", vd._runtime_disabled_video_codecs)
+
+    def test_combine_videos_by_segments_uses_selection_trim_window(self):
+        """
+        逐句候选编辑器传入 trim_start/trim_end 后，视频合成必须先按这个
+        窗口截取素材，而不是总从素材 0 秒开始。
+        """
+        subclip_calls = []
+
+        class _FakeAudioClip:
+            duration = 3.0
+
+        class _FakeClip:
+            def __init__(self, duration=10.0):
+                self.duration = duration
+                self.size = (1080, 1920)
+                self.w = 1080
+                self.h = 1920
+
+            def subclipped(self, start, end):
+                subclip_calls.append((start, end))
+                return _FakeClip(duration=end - start)
+
+            def with_effects(self, effects):
+                return self
+
+            def with_duration(self, duration):
+                self.duration = duration
+                return self
+
+        def fake_write(clip, output_file, codec, **kwargs):
+            Path(output_file).write_bytes(b"fake-segment")
+            return codec
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            combined_path = os.path.join(temp_dir, "combined.mp4")
+            with (
+                patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()),
+                patch.object(vd, "_open_video_clip_quietly", return_value=_FakeClip()),
+                patch.object(vd, "_resize_clip_to_aspect", side_effect=lambda clip, *_: clip),
+                patch.object(vd, "_apply_transition", side_effect=lambda clip, *_: clip),
+                patch.object(vd, "_write_videofile_with_codec_fallback", side_effect=fake_write),
+            ):
+                vd.combine_videos_by_segments(
+                    combined_video_path=combined_path,
+                    segments=[
+                        {
+                            "index": 1,
+                            "material": "/tmp/source.mp4",
+                            "start": 0.0,
+                            "end": 3.0,
+                            "duration": 3.0,
+                            "trim_start": 2.0,
+                            "trim_end": 6.0,
+                        }
+                    ],
+                    audio_file="/tmp/audio.mp3",
+                )
+
+            self.assertTrue(os.path.exists(combined_path))
+
+        self.assertEqual(subclip_calls[0], (2.0, 6.0))
 
     def test_concat_video_clips_does_not_disable_codec_when_fallback_also_fails(self):
         """

@@ -1,5 +1,6 @@
 import unittest
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -171,6 +172,50 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(segments[0]["duration"], 2.5)
         self.assertEqual(segments[0]["material"], "")
 
+    def test_write_audio_segment_files_decodes_mp3_without_ffprobe(self):
+        """
+        pydub calls ffprobe when MP3 metadata probing is left implicit. The editor
+        flow should decode generated MP3 audio with an explicit codec so machines
+        without ffprobe on PATH can still prepare sentence audio slices.
+        """
+
+        class _FakeAudio:
+            def __len__(self):
+                return 3000
+
+            def __getitem__(self, key):
+                return self
+
+            def export(self, output_path, format):
+                Path(output_path).write_bytes(b"fake-mp3")
+                return None
+
+        task_id = "mp3-no-ffprobe-task"
+        task_dir = tm.utils.task_dir(task_id)
+        try:
+            with (
+                patch("pydub.AudioSegment.from_file", return_value=_FakeAudio()) as from_file,
+                patch.object(tm.voice, "_configure_pydub_ffmpeg"),
+            ):
+                segments, tail_pause = tm._write_audio_segment_files(
+                    task_id,
+                    "audio.mp3",
+                    [
+                        {
+                            "index": 1,
+                            "text": "One line.",
+                            "start": 0.0,
+                            "end": 1.0,
+                        }
+                    ],
+                )
+
+            from_file.assert_called_once_with("audio.mp3", format="mp3", codec="mp3")
+            self.assertTrue(Path(segments[0]["audio_segment"]["file"]).exists())
+            self.assertEqual(tail_pause, 2.0)
+        finally:
+            shutil.rmtree(task_dir, ignore_errors=True)
+
     def test_generate_final_videos_falls_back_without_matched_segments(self):
         params = VideoParams(
             video_subject="fallback",
@@ -202,6 +247,73 @@ class TestTaskService(unittest.TestCase):
         generate_video.assert_called_once()
         self.assertEqual(len(final_paths), 1)
         self.assertEqual(len(combined_paths), 1)
+
+    def test_render_selection_rejects_unknown_candidate_id(self):
+        """
+        最终渲染接口只能接受 script.json 中已经准备好的 candidate_id，
+        不能让前端提交任意文件路径绕过候选素材白名单。
+        """
+        task_id = "render-selection-invalid-candidate"
+        task_dir = tm.utils.task_dir(task_id)
+        params = VideoParams(
+            video_subject="editor",
+            video_script="One line.",
+            video_terms="city",
+            video_source="pexels",
+            match_materials_to_script=True,
+        )
+        matched_segments = [
+            {
+                "index": 1,
+                "text": "One line.",
+                "term": "city",
+                "start": 0.0,
+                "end": 1.0,
+                "duration": 1.0,
+                "material": "/tmp/allowed.mp4",
+                "candidates": [
+                    {
+                        "candidate_id": "seg-1-cand-1",
+                        "rank": 1,
+                        "material": "/tmp/allowed.mp4",
+                        "source_url": "https://example.com/allowed.mp4",
+                        "duration": 5,
+                        "provider": "pexels",
+                    }
+                ],
+                "audio_segment": {
+                    "file": "/tmp/audio.mp3",
+                    "pause_before": 0.0,
+                    "original_text": "One line.",
+                },
+            }
+        ]
+
+        try:
+            tm.save_script_data(
+                task_id,
+                "One line.",
+                ["city"],
+                params,
+                matched_segments=matched_segments,
+                extra={"audio_tail_pause": 0},
+            )
+
+            with self.assertRaises(ValueError):
+                tm._render_selection_impl(
+                    task_id,
+                    [
+                        {
+                            "segment_index": 1,
+                            "candidate_id": "not-from-this-task",
+                            "trim_start": 0,
+                            "trim_end": 1,
+                            "text": "One line.",
+                        }
+                    ],
+                )
+        finally:
+            shutil.rmtree(task_dir, ignore_errors=True)
     
     def test_task_local_materials(self):
         task_id = "00000000-0000-0000-0000-000000000000"

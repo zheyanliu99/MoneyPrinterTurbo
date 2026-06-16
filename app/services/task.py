@@ -1,3 +1,4 @@
+import json
 import math
 import os.path
 import re
@@ -269,7 +270,14 @@ def build_matched_segments(video_script, video_terms, subtitle_path):
     return matched_segments
 
 
-def save_script_data(task_id, video_script, video_terms, params, matched_segments=None):
+def save_script_data(
+    task_id,
+    video_script,
+    video_terms,
+    params,
+    matched_segments=None,
+    extra=None,
+):
     script_file = path.join(utils.task_dir(task_id), "script.json")
     script_data = {
         "script": video_script,
@@ -278,9 +286,86 @@ def save_script_data(task_id, video_script, video_terms, params, matched_segment
     }
     if matched_segments is not None:
         script_data["matched_segments"] = matched_segments
+    if extra:
+        script_data.update(extra)
 
     with open(script_file, "w", encoding="utf-8") as f:
         f.write(utils.to_json(script_data))
+
+
+def _read_script_data(task_id):
+    script_file = path.join(utils.task_dir(task_id), "script.json")
+    if not path.exists(script_file):
+        raise ValueError(f"script data not found for task: {task_id}")
+    with open(script_file, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _coerce_video_params(raw_params):
+    if isinstance(raw_params, VideoParams):
+        return raw_params
+    if not isinstance(raw_params, dict):
+        raise ValueError("invalid saved video params")
+    return VideoParams(**raw_params)
+
+
+def _write_audio_segment_files(task_id, audio_file, matched_segments):
+    from pydub import AudioSegment
+
+    voice._configure_pydub_ffmpeg(AudioSegment)
+    source_audio = AudioSegment.from_file(audio_file, format="mp3", codec="mp3")
+    segments_dir = path.join(utils.task_dir(task_id), "audio_segments")
+    os.makedirs(segments_dir, exist_ok=True)
+
+    updated_segments = []
+    previous_end_ms = 0
+    for segment in matched_segments:
+        segment_info = dict(segment)
+        segment_index = int(segment_info.get("index") or len(updated_segments) + 1)
+        start_ms = max(0, int(float(segment_info.get("start") or 0.0) * 1000))
+        end_ms = max(start_ms + 1, int(float(segment_info.get("end") or 0.0) * 1000))
+        start_ms = min(start_ms, len(source_audio))
+        end_ms = min(max(end_ms, start_ms + 1), len(source_audio))
+
+        segment_audio = source_audio[start_ms:end_ms]
+        segment_audio_path = path.join(
+            segments_dir, f"segment-{segment_index:03d}.mp3"
+        )
+        segment_audio.export(segment_audio_path, format="mp3")
+        pause_before_ms = max(0, start_ms - previous_end_ms)
+        previous_end_ms = max(previous_end_ms, end_ms)
+
+        segment_info["audio_segment"] = {
+            "file": segment_audio_path,
+            "pause_before": round(pause_before_ms / 1000, 3),
+            "original_text": segment_info.get("text", ""),
+        }
+        updated_segments.append(segment_info)
+
+    audio_tail_pause = max(0, len(source_audio) - previous_end_ms) / 1000
+    return updated_segments, round(audio_tail_pause, 3)
+
+
+def _selection_to_dict(selection):
+    if hasattr(selection, "model_dump"):
+        return selection.model_dump()
+    if isinstance(selection, dict):
+        return dict(selection)
+    raise ValueError("invalid selection item")
+
+
+def _write_subtitle_file(subtitle_path, matched_segments):
+    with open(subtitle_path, "w", encoding="utf-8") as f:
+        for segment in matched_segments:
+            f.write(
+                utils.text_to_srt(
+                    int(segment["index"]),
+                    segment["text"],
+                    float(segment["start"]),
+                    float(segment["end"]),
+                )
+            )
+            f.write("\n")
 
 
 def generate_audio(task_id, params, video_script):
@@ -517,6 +602,313 @@ def generate_final_videos(
     return final_video_paths, combined_video_paths
 
 
+def _prepare_candidates_from_timeline(
+    task_id,
+    params,
+    video_script,
+    video_terms,
+    audio_file,
+    audio_duration,
+    subtitle_path,
+    matched_segments,
+):
+    if params.video_source != "pexels":
+        raise ValueError("candidate editor currently supports Pexels only.")
+    if not matched_segments:
+        raise ValueError(
+            "candidate editor needs a valid subtitle timeline. Enable subtitles and TTS."
+        )
+
+    matched_segments, audio_tail_pause = _write_audio_segment_files(
+        task_id, audio_file, matched_segments
+    )
+    candidate_paths, matched_segments = material.download_candidate_videos_for_segments(
+        task_id=task_id,
+        segments=matched_segments,
+        source="pexels",
+        video_aspect=params.video_aspect,
+        max_clip_duration=params.video_clip_duration,
+        candidates_per_segment=3,
+    )
+    first_segment = matched_segments[0] if matched_segments else {}
+    if not first_segment.get("candidates"):
+        raise ValueError(
+            "Pexels returned no candidate videos for the first sentence. "
+            "Try a clearer first keyword."
+        )
+
+    extra = {
+        "audio_file": audio_file,
+        "audio_duration": audio_duration,
+        "subtitle_path": subtitle_path,
+        "requires_selection": True,
+        "audio_tail_pause": audio_tail_pause,
+    }
+    save_script_data(
+        task_id,
+        video_script,
+        video_terms,
+        params,
+        matched_segments=matched_segments,
+        extra=extra,
+    )
+
+    kwargs = {
+        "script": video_script,
+        "terms": video_terms,
+        "audio_file": audio_file,
+        "audio_duration": audio_duration,
+        "subtitle_path": subtitle_path,
+        "materials": candidate_paths,
+        "matched_segments": matched_segments,
+        "requires_selection": True,
+    }
+    sm.state.update_task(
+        task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
+    )
+    return kwargs
+
+
+def _render_selection_impl(task_id, selections):
+    logger.info(f"rendering selected candidates for task: {task_id}")
+    selections = [_selection_to_dict(selection) for selection in selections]
+    if not selections:
+        raise ValueError("render selection requires at least one selected segment.")
+
+    script_data = _read_script_data(task_id)
+    params = _coerce_video_params(script_data.get("params") or {})
+    params.match_materials_to_script = True
+    params.video_concat_mode = VideoConcatMode.sequential.value
+    params.video_transition_mode = None
+    params.video_count = 1
+
+    original_segments = script_data.get("matched_segments") or []
+    if not original_segments:
+        raise ValueError("no candidate segments found for this task.")
+
+    sm.state.update_task(
+        task_id,
+        state=const.TASK_STATE_PROCESSING,
+        progress=10,
+        matched_segments=original_segments,
+        requires_selection=True,
+    )
+
+    segment_by_index = {
+        int(segment.get("index") or 0): segment for segment in original_segments
+    }
+    selections_by_index = {
+        int(selection.get("segment_index") or 0): selection for selection in selections
+    }
+    missing_indexes = [
+        int(segment.get("index") or 0)
+        for segment in original_segments
+        if int(segment.get("index") or 0) not in selections_by_index
+    ]
+    if missing_indexes:
+        raise ValueError(f"missing selections for segments: {missing_indexes}")
+
+    selected_segments = []
+    for segment_index in sorted(segment_by_index):
+        segment = segment_by_index[segment_index]
+        selection = selections_by_index[segment_index]
+        candidates = segment.get("candidates") or []
+        candidate_map = {
+            str(candidate.get("candidate_id")): candidate for candidate in candidates
+        }
+        candidate_id = str(selection.get("candidate_id") or "")
+        if candidate_id not in candidate_map:
+            raise ValueError(
+                f"invalid candidate_id for segment {segment_index}: {candidate_id}"
+            )
+
+        candidate = candidate_map[candidate_id]
+        trim_start = float(selection.get("trim_start") or 0.0)
+        trim_end = selection.get("trim_end")
+        trim_end = float(trim_end) if trim_end not in (None, "") else None
+        candidate_duration = float(candidate.get("duration") or 0.0)
+        if trim_start < 0:
+            raise ValueError(f"trim_start must be >= 0 for segment {segment_index}")
+        if trim_end is not None and trim_end <= trim_start:
+            raise ValueError(
+                f"trim_end must be greater than trim_start for segment {segment_index}"
+            )
+        if candidate_duration > 0:
+            if trim_start >= candidate_duration:
+                raise ValueError(
+                    f"trim_start exceeds candidate duration for segment {segment_index}"
+                )
+            if trim_end is not None and trim_end > candidate_duration + 0.1:
+                raise ValueError(
+                    f"trim_end exceeds candidate duration for segment {segment_index}"
+                )
+
+        selected_text = (selection.get("text") or segment.get("text") or "").strip()
+        segment_info = dict(segment)
+        segment_info["text"] = selected_text
+        segment_info["candidate_id"] = candidate_id
+        segment_info["material"] = candidate["material"]
+        segment_info["material_source_url"] = candidate.get("source_url", "")
+        segment_info["provider"] = candidate.get("provider", "pexels")
+        segment_info["trim_start"] = round(trim_start, 3)
+        segment_info["trim_end"] = (
+            round(trim_end, 3)
+            if trim_end is not None
+            else round(candidate_duration, 3)
+        )
+        selected_segments.append(segment_info)
+
+    sm.state.update_task(
+        task_id,
+        state=const.TASK_STATE_PROCESSING,
+        progress=25,
+        matched_segments=selected_segments,
+        requires_selection=True,
+    )
+
+    from pydub import AudioSegment
+
+    voice._configure_pydub_ffmpeg(AudioSegment)
+    edited_audio = AudioSegment.empty()
+    edited_segments = []
+    edited_audio_dir = path.join(utils.task_dir(task_id), "edited_audio_segments")
+    os.makedirs(edited_audio_dir, exist_ok=True)
+
+    for segment in selected_segments:
+        segment_index = int(segment.get("index") or len(edited_segments) + 1)
+        audio_segment_info = segment.get("audio_segment") or {}
+        pause_before = max(float(audio_segment_info.get("pause_before") or 0.0), 0.0)
+        if pause_before > 0:
+            edited_audio += AudioSegment.silent(duration=int(pause_before * 1000))
+
+        original_text = (
+            audio_segment_info.get("original_text") or segment.get("text") or ""
+        ).strip()
+        selected_text = (segment.get("text") or "").strip()
+        original_segment_file = audio_segment_info.get("file", "")
+        segment_audio_file = original_segment_file
+
+        if selected_text != original_text:
+            segment_audio_file = path.join(
+                edited_audio_dir, f"segment-{segment_index:03d}.mp3"
+            )
+            sub_maker = voice.tts(
+                text=selected_text,
+                voice_name=_resolve_voice_name_for_script(
+                    params.voice_name, selected_text
+                ),
+                voice_rate=params.voice_rate,
+                voice_file=segment_audio_file,
+                voice_volume=params.voice_volume,
+            )
+            if sub_maker is None or not path.exists(segment_audio_file):
+                raise ValueError(
+                    f"failed to regenerate TTS for segment {segment_index}"
+                )
+        elif not original_segment_file or not path.exists(original_segment_file):
+            raise ValueError(
+                f"original audio slice missing for segment {segment_index}"
+            )
+
+        segment_audio = AudioSegment.from_file(
+            segment_audio_file, format="mp3", codec="mp3"
+        )
+        start_time = len(edited_audio) / 1000
+        edited_audio += segment_audio
+        end_time = len(edited_audio) / 1000
+
+        edited_segment = dict(segment)
+        edited_segment["start"] = round(start_time, 3)
+        edited_segment["end"] = round(end_time, 3)
+        edited_segment["duration"] = round(end_time - start_time, 3)
+        edited_segment["audio_segment"] = {
+            **audio_segment_info,
+            "file": segment_audio_file,
+            "pause_before": round(pause_before, 3),
+            "original_text": selected_text,
+        }
+        edited_segments.append(edited_segment)
+
+    tail_pause = max(float(script_data.get("audio_tail_pause") or 0.0), 0.0)
+    if tail_pause > 0:
+        edited_audio += AudioSegment.silent(duration=int(tail_pause * 1000))
+
+    edited_audio_file = path.join(utils.task_dir(task_id), "audio-edited.mp3")
+    edited_audio.export(edited_audio_file, format="mp3")
+    edited_subtitle_path = path.join(utils.task_dir(task_id), "subtitle-edited.srt")
+    _write_subtitle_file(edited_subtitle_path, edited_segments)
+    audio_duration = voice.get_audio_duration(edited_audio_file)
+
+    sm.state.update_task(
+        task_id,
+        state=const.TASK_STATE_PROCESSING,
+        progress=45,
+        matched_segments=edited_segments,
+        requires_selection=False,
+    )
+
+    downloaded_videos = [segment["material"] for segment in edited_segments]
+    final_video_paths, combined_video_paths = generate_final_videos(
+        task_id,
+        params,
+        downloaded_videos,
+        edited_audio_file,
+        edited_subtitle_path,
+        edited_segments,
+    )
+    if not final_video_paths:
+        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        return
+
+    script_file_extra = {
+        "audio_file": edited_audio_file,
+        "audio_duration": audio_duration,
+        "subtitle_path": edited_subtitle_path,
+        "requires_selection": False,
+        "selected_segments": edited_segments,
+        "audio_tail_pause": tail_pause,
+    }
+    save_script_data(
+        task_id,
+        script_data.get("script", ""),
+        script_data.get("search_terms", []),
+        params,
+        matched_segments=edited_segments,
+        extra=script_file_extra,
+    )
+
+    kwargs = {
+        "videos": final_video_paths,
+        "combined_videos": combined_video_paths,
+        "script": script_data.get("script", ""),
+        "terms": script_data.get("search_terms", []),
+        "audio_file": edited_audio_file,
+        "audio_duration": audio_duration,
+        "subtitle_path": edited_subtitle_path,
+        "materials": downloaded_videos,
+        "matched_segments": edited_segments,
+        "requires_selection": False,
+    }
+    sm.state.update_task(
+        task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
+    )
+    return kwargs
+
+
+def render_selection(task_id, selections):
+    try:
+        return _render_selection_impl(task_id, selections)
+    except Exception as exc:
+        logger.exception(f"failed to render selected candidates: {str(exc)}")
+        sm.state.update_task(
+            task_id,
+            state=const.TASK_STATE_FAILED,
+            progress=100,
+            error=str(exc),
+        )
+        return
+
+
 def start(task_id, params: VideoParams, stop_at: str = "video"):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
@@ -605,6 +997,34 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
             matched_segments=matched_segments,
         )
         return {"subtitle_path": subtitle_path, "matched_segments": matched_segments}
+
+    if stop_at == "candidates":
+        try:
+            params.video_source = "pexels"
+            params.match_materials_to_script = True
+            params.video_concat_mode = VideoConcatMode.sequential.value
+            params.video_transition_mode = None
+            params.bgm_type = ""
+            params.video_count = 1
+            return _prepare_candidates_from_timeline(
+                task_id=task_id,
+                params=params,
+                video_script=video_script,
+                video_terms=video_terms,
+                audio_file=audio_file,
+                audio_duration=audio_duration,
+                subtitle_path=subtitle_path,
+                matched_segments=matched_segments,
+            )
+        except Exception as exc:
+            logger.exception(f"failed to prepare candidate materials: {str(exc)}")
+            sm.state.update_task(
+                task_id,
+                state=const.TASK_STATE_FAILED,
+                progress=100,
+                error=str(exc),
+            )
+            return
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 

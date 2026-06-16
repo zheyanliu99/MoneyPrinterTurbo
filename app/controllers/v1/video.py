@@ -20,6 +20,7 @@ from app.models.schema import (
     AudioRequest,
     BgmRetrieveResponse,
     BgmUploadResponse,
+    RenderSelectionRequest,
     SubtitleRequest,
     TaskDeletionResponse,
     TaskQueryRequest,
@@ -112,11 +113,83 @@ def _task_file_to_uri(file: str, endpoint: str, task_dir: str, request_id: str) 
     return f"/{uri_path}"
 
 
+def _map_segment_media_urls(segments, endpoint: str, task_dir: str, request_id: str):
+    if not isinstance(segments, list):
+        return segments
+
+    mapped_segments = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            mapped_segments.append(segment)
+            continue
+
+        mapped_segment = dict(segment)
+        material = mapped_segment.get("material")
+        if material:
+            mapped_segment["material_url"] = _task_file_to_uri(
+                material, endpoint, task_dir, request_id
+            )
+
+        candidates = mapped_segment.get("candidates")
+        if isinstance(candidates, list):
+            mapped_candidates = []
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    mapped_candidates.append(candidate)
+                    continue
+                mapped_candidate = dict(candidate)
+                candidate_material = mapped_candidate.get("material")
+                if candidate_material:
+                    mapped_candidate["preview_url"] = _task_file_to_uri(
+                        candidate_material, endpoint, task_dir, request_id
+                    )
+                mapped_candidates.append(mapped_candidate)
+            mapped_segment["candidates"] = mapped_candidates
+
+        mapped_segments.append(mapped_segment)
+    return mapped_segments
+
+
+def _map_task_media_urls(response_task, endpoint: str, task_dir: str, request_id: str):
+    for key in ("videos", "combined_videos", "materials"):
+        if key in response_task and isinstance(response_task[key], list):
+            response_task[key] = [
+                _task_file_to_uri(v, endpoint, task_dir, request_id)
+                for v in response_task[key]
+            ]
+
+    for key in ("matched_segments", "selected_segments"):
+        if key in response_task:
+            response_task[key] = _map_segment_media_urls(
+                response_task[key], endpoint, task_dir, request_id
+            )
+
+    return response_task
+
+
 @router.post("/videos", response_model=TaskResponse, summary="Generate a short video")
 def create_video(
     background_tasks: BackgroundTasks, request: Request, body: TaskVideoRequest
 ):
     return create_task(request, body, stop_at="video")
+
+
+@router.post(
+    "/videos/candidates",
+    response_model=TaskResponse,
+    summary="Prepare editable Pexels candidates for each script sentence",
+)
+def create_video_candidates(
+    background_tasks: BackgroundTasks, request: Request, body: TaskVideoRequest
+):
+    body.video_source = "pexels"
+    body.match_materials_to_script = True
+    body.video_concat_mode = "sequential"
+    body.video_transition_mode = None
+    body.bgm_type = ""
+    body.subtitle_enabled = True
+    body.video_count = 1
+    return create_task(request, body, stop_at="candidates")
 
 
 @router.post("/subtitle", response_model=TaskResponse, summary="Generate subtitle only")
@@ -163,6 +236,38 @@ def create_task(
             task_id=task_id, status_code=400, message=f"{request_id}: {str(e)}"
         )
 
+
+@router.post(
+    "/tasks/{task_id}/render-selection",
+    response_model=TaskResponse,
+    summary="Render final video from selected candidate materials",
+)
+def render_video_selection(
+    request: Request,
+    body: RenderSelectionRequest,
+    task_id: str = Path(..., description="Task ID"),
+):
+    request_id = base.get_task_id(request)
+    task = sm.state.get_task(task_id)
+    if not task:
+        raise HttpException(
+            task_id=task_id, status_code=404, message=f"{request_id}: task not found"
+        )
+
+    try:
+        task_manager.add_task(
+            tm.render_selection, task_id=task_id, selections=body.selections
+        )
+        return utils.get_response(200, {"task_id": task_id})
+    except TaskQueueFullError as e:
+        logger.warning(
+            f"reject render-selection because queue is full, request_id: {request_id}, task_id: {task_id}"
+        )
+        raise HttpException(
+            task_id=task_id, status_code=429, message=f"{request_id}: {str(e)}"
+        )
+
+
 @router.get("/tasks", response_model=TaskQueryResponse, summary="Get all tasks")
 def get_all_tasks(request: Request, page: int = Query(1, ge=1), page_size: int = Query(10, ge=1)):
     tasks, total = sm.state.get_all_tasks(page, page_size)
@@ -191,17 +296,9 @@ def get_task(
     if task:
         task_dir = utils.task_dir()
         response_task = dict(task)
-
-        if "videos" in task:
-            response_task["videos"] = [
-                _task_file_to_uri(v, endpoint, task_dir, request_id)
-                for v in task["videos"]
-            ]
-        if "combined_videos" in task:
-            response_task["combined_videos"] = [
-                _task_file_to_uri(v, endpoint, task_dir, request_id)
-                for v in task["combined_videos"]
-            ]
+        response_task = _map_task_media_urls(
+            response_task, endpoint, task_dir, request_id
+        )
         return utils.get_response(200, response_task)
 
     raise HttpException(

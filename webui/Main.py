@@ -24,6 +24,7 @@ from app.models.schema import (
     VideoTransitionMode,
 )
 from app.services import llm, voice
+from app.services import state as sm
 from app.services import task as tm
 from app.utils import utils
 
@@ -251,6 +252,350 @@ def get_groq_model_ids(api_key: str, base_url: str) -> list[str]:
     except Exception as e:
         logger.warning(f"failed to fetch groq models: {e}")
         return []
+
+
+def _as_list_config_value(key: str) -> list:
+    value = config.app.get(key, [])
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _build_editor_params() -> VideoParams:
+    params = VideoParams(
+        video_subject=st.session_state.get("video_subject", "").strip(),
+        video_script=st.session_state.get("video_script", "").strip(),
+        video_terms=st.session_state.get("video_terms", "").strip(),
+        video_source="pexels",
+        video_aspect=st.session_state.get(
+            "simple_video_aspect", VideoAspect.portrait.value
+        ),
+        video_concat_mode=VideoConcatMode.sequential.value,
+        video_transition_mode=None,
+        video_clip_duration=int(st.session_state.get("simple_clip_duration", 5)),
+        match_materials_to_script=True,
+        video_count=1,
+        voice_name=st.session_state.get(
+            "simple_voice_name",
+            config.ui.get("voice_name", "en-AU-NatashaNeural-Female"),
+        ),
+        voice_rate=float(st.session_state.get("simple_voice_rate", 1.0)),
+        voice_volume=1.0,
+        bgm_type="",
+        bgm_file="",
+        bgm_volume=0.0,
+        subtitle_enabled=True,
+        subtitle_position=st.session_state.get("simple_subtitle_position", "bottom"),
+        font_name=st.session_state.get("simple_font_name", "STHeitiMedium.ttc"),
+        text_fore_color=st.session_state.get("simple_text_fore_color", "#FFFFFF"),
+        text_background_color=st.session_state.get(
+            "simple_text_background_color", True
+        ),
+        rounded_subtitle_background=bool(
+            st.session_state.get("simple_rounded_subtitle_background", False)
+        ),
+        font_size=int(st.session_state.get("simple_font_size", 60)),
+        stroke_color=st.session_state.get("simple_stroke_color", "#000000"),
+        stroke_width=float(st.session_state.get("simple_stroke_width", 1.5)),
+        n_threads=int(st.session_state.get("simple_n_threads", 2)),
+        paragraph_number=1,
+        video_script_prompt=st.session_state.get("video_script_prompt", ""),
+        custom_system_prompt=st.session_state.get("custom_system_prompt", ""),
+    )
+    return params
+
+
+def _show_video_preview(video_path: str, caption: str = ""):
+    if not video_path:
+        st.caption(caption or "No preview")
+        return
+    try:
+        if os.path.exists(video_path):
+            st.video(video_path)
+        else:
+            st.video(video_path)
+        if caption:
+            st.caption(caption)
+    except Exception as e:
+        st.caption(caption or video_path)
+        logger.warning(f"failed to render video preview: {video_path}, error: {e}")
+
+
+def _load_candidate_task(task_id: str):
+    if not task_id:
+        return None
+    return sm.state.get_task(task_id)
+
+
+def _render_candidate_editor(task_data: dict):
+    matched_segments = task_data.get("matched_segments") or []
+    if not matched_segments:
+        st.info("还没有候选素材。先点击“准备候选素材”。")
+        return
+
+    st.subheader("逐句候选素材")
+    st.caption("每一句字幕对应一个关键词和最多三条 Pexels 候选视频。选择视频后可以设置裁剪起止。")
+    selections = []
+
+    for segment in matched_segments:
+        segment_index = int(segment.get("index") or len(selections) + 1)
+        candidates = segment.get("candidates") or []
+        with st.container(border=True):
+            st.markdown(
+                f"**{segment_index}. {segment.get('text', '')}**  \n"
+                f"关键词：`{segment.get('term', '')}` · 当前时长："
+                f"{float(segment.get('duration') or 0):.2f}s"
+            )
+            if not candidates:
+                st.error("这一句没有可用候选素材。")
+                continue
+
+            preview_cols = st.columns(min(3, len(candidates)))
+            for preview_col, candidate in zip(preview_cols, candidates):
+                with preview_col:
+                    _show_video_preview(
+                        candidate.get("material", ""),
+                        caption=(
+                            f"候选 {candidate.get('rank')}"
+                            + (" · fallback" if candidate.get("fallback") else "")
+                        ),
+                    )
+
+            default_candidate_id = candidates[0].get("candidate_id", "")
+            selected_candidate_id = st.radio(
+                "选择候选视频",
+                options=[candidate.get("candidate_id", "") for candidate in candidates],
+                index=0,
+                key=f"candidate_choice_{segment_index}",
+                horizontal=True,
+                format_func=lambda candidate_id, items=candidates: next(
+                    (
+                        f"候选 {item.get('rank')}"
+                        + (" · 复用" if item.get("fallback") else "")
+                        for item in items
+                        if item.get("candidate_id") == candidate_id
+                    ),
+                    candidate_id,
+                ),
+            ) or default_candidate_id
+
+            selected_candidate = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.get("candidate_id") == selected_candidate_id
+                ),
+                candidates[0],
+            )
+            candidate_duration = float(selected_candidate.get("duration") or 0.0)
+            trim_start_key = f"trim_start_{segment_index}"
+            trim_end_key = f"trim_end_{segment_index}"
+            max_trim_start = (
+                max(candidate_duration - 0.1, 0.0)
+                if candidate_duration > 0.1
+                else None
+            )
+            current_trim_start = max(
+                float(st.session_state.get(trim_start_key, 0.0)), 0.0
+            )
+            if max_trim_start is not None:
+                current_trim_start = min(current_trim_start, max_trim_start)
+            current_trim_end = float(
+                st.session_state.get(
+                    trim_end_key,
+                    candidate_duration
+                    or max(float(segment.get("duration") or 1.0), 1.0),
+                )
+            )
+            min_trim_end = current_trim_start + 0.1
+            if candidate_duration > 0:
+                current_trim_end = min(current_trim_end, candidate_duration)
+            current_trim_end = max(current_trim_end, min_trim_end)
+            if trim_start_key in st.session_state:
+                st.session_state[trim_start_key] = current_trim_start
+            if trim_end_key in st.session_state:
+                st.session_state[trim_end_key] = current_trim_end
+
+            trim_cols = st.columns(2)
+            with trim_cols[0]:
+                trim_start = st.number_input(
+                    "裁剪开始秒",
+                    min_value=0.0,
+                    max_value=max_trim_start,
+                    value=current_trim_start,
+                    step=0.1,
+                    key=trim_start_key,
+                )
+            with trim_cols[1]:
+                trim_end = st.number_input(
+                    "裁剪结束秒",
+                    min_value=float(trim_start) + 0.1,
+                    max_value=candidate_duration if candidate_duration > 0 else None,
+                    value=current_trim_end,
+                    step=0.1,
+                    key=trim_end_key,
+                )
+
+            edited_text = st.text_area(
+                "单句字幕 / 配音文本",
+                value=segment.get("text", ""),
+                height=90,
+                key=f"segment_text_{segment_index}",
+            )
+            selections.append(
+                {
+                    "segment_index": segment_index,
+                    "candidate_id": selected_candidate_id,
+                    "trim_start": float(trim_start),
+                    "trim_end": float(trim_end),
+                    "text": edited_text,
+                }
+            )
+
+    st.session_state["candidate_selections"] = selections
+
+
+def _render_simple_editor():
+    st.markdown("### 视频生成")
+    st.text_input("标题", key="video_subject", placeholder="例如：中国五大城市实力排名")
+    st.text_area(
+        "Scripts",
+        key="video_script",
+        height=300,
+        placeholder="每一句单独成段，逐句匹配素材会更稳定。",
+    )
+    st.text_area(
+        "关键词",
+        key="video_terms",
+        height=150,
+        placeholder="每句一个关键词，用英文逗号分隔。例如：Shanghai skyline, Beijing CBD...",
+    )
+
+    with st.expander("高级设置", expanded=False):
+        st.caption("默认使用 Pexels、9:16、顺序拼接、无转场、无 BGM、开启字幕和逐句匹配。")
+        pexels_keys = _as_list_config_value("pexels_api_keys")
+        config.app["pexels_api_keys"] = pexels_keys
+        new_pexels_key = st.text_input("Pexels API Key", type="password")
+        if st.button("保存 Pexels Key"):
+            if new_pexels_key and new_pexels_key not in config.app["pexels_api_keys"]:
+                config.app["pexels_api_keys"].append(new_pexels_key)
+                config.save_config()
+                st.success("Pexels Key 已保存")
+            elif new_pexels_key:
+                st.info("这个 Pexels Key 已存在")
+            else:
+                st.warning("请输入有效的 Pexels Key")
+
+        aspect_options = [item.value for item in VideoAspect]
+        st.selectbox(
+            "画面比例",
+            options=aspect_options,
+            index=aspect_options.index(
+                st.session_state.get("simple_video_aspect", VideoAspect.portrait.value)
+            ),
+            key="simple_video_aspect",
+        )
+        st.text_input(
+            "Voice",
+            value=config.ui.get("voice_name", "en-AU-NatashaNeural-Female"),
+            key="simple_voice_name",
+        )
+        st.slider(
+            "语速",
+            min_value=0.5,
+            max_value=2.0,
+            value=float(st.session_state.get("simple_voice_rate", 1.0)),
+            step=0.1,
+            key="simple_voice_rate",
+        )
+        st.number_input(
+            "旧模式最大片段时长 / 候选搜索最小时长",
+            min_value=1,
+            max_value=20,
+            value=int(st.session_state.get("simple_clip_duration", 5)),
+            key="simple_clip_duration",
+        )
+        st.number_input(
+            "字幕字号",
+            min_value=20,
+            max_value=120,
+            value=int(st.session_state.get("simple_font_size", 60)),
+            key="simple_font_size",
+        )
+
+    action_cols = st.columns(2)
+    with action_cols[0]:
+        prepare_clicked = st.button(
+            "准备候选素材", use_container_width=True, type="primary"
+        )
+    with action_cols[1]:
+        render_clicked = st.button("渲染最终视频", use_container_width=True)
+
+    if prepare_clicked:
+        config.save_config()
+        params = _build_editor_params()
+        if not params.video_subject and not params.video_script:
+            st.error("标题和 scripts 不能同时为空。")
+            st.stop()
+        if not _as_list_config_value("pexels_api_keys"):
+            st.error("请先在高级设置里保存 Pexels API Key。")
+            st.stop()
+
+        task_id = str(uuid4())
+        st.session_state["candidate_task_id"] = task_id
+        with st.spinner("正在生成音频、字幕，并为每句下载 3 条候选视频..."):
+            tm.start(task_id=task_id, params=params, stop_at="candidates")
+        task_data = _load_candidate_task(task_id) or {}
+        if task_data.get("state") == -1:
+            st.error(task_data.get("error", "准备候选素材失败。"))
+        else:
+            st.session_state["candidate_task_data"] = task_data
+            st.success("候选素材准备完成，可以逐句选择和裁剪。")
+
+    task_data = st.session_state.get("candidate_task_data")
+    task_id = st.session_state.get("candidate_task_id")
+    if task_id:
+        task_data = _load_candidate_task(task_id) or task_data
+        if task_data:
+            st.session_state["candidate_task_data"] = task_data
+            _render_candidate_editor(task_data)
+
+    if render_clicked:
+        task_id = st.session_state.get("candidate_task_id")
+        selections = st.session_state.get("candidate_selections") or []
+        if not task_id or not selections:
+            st.error("请先准备候选素材，并完成每句视频选择。")
+            st.stop()
+
+        with st.spinner("正在按你的选择重建音频、字幕并渲染视频..."):
+            tm.render_selection(task_id=task_id, selections=selections)
+        task_data = _load_candidate_task(task_id) or {}
+        st.session_state["candidate_task_data"] = task_data
+        if task_data.get("state") == -1:
+            st.error(task_data.get("error", "渲染失败。"))
+        else:
+            st.success("最终视频已生成。")
+
+    latest_task = st.session_state.get("candidate_task_data") or {}
+    final_videos = latest_task.get("videos") or []
+    if final_videos:
+        st.subheader("最终视频")
+        for video_path in final_videos:
+            _show_video_preview(video_path)
+        if latest_task.get("task_id"):
+            st.button(
+                tr("Open Task Folder"),
+                key="simple_open_task_folder",
+                on_click=lambda task_id=latest_task.get("task_id"): open_task_folder(
+                    task_id
+                ),
+            )
+
+
+_render_simple_editor()
+st.stop()
 
 # 创建基础设置折叠框
 if not config.app.get("hide_config", False):

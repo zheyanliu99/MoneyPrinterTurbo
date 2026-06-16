@@ -206,6 +206,18 @@ class TaskVideoRequest(VideoParams, BaseModel):
     pass
 
 
+class CandidateSelectionItem(BaseModel):
+    segment_index: int = Field(..., ge=1)
+    candidate_id: str = Field(..., min_length=1)
+    trim_start: float = Field(default=0.0, ge=0)
+    trim_end: Optional[float] = None
+    text: Optional[str] = ""
+
+
+class RenderSelectionRequest(BaseModel):
+    selections: List[CandidateSelectionItem] = Field(default_factory=list)
+
+
 class TaskQueryRequest(BaseModel):
     pass
 

@@ -40,6 +40,8 @@ def _configure_pydub_ffmpeg(audio_segment_cls):
     configured_ffmpeg = utils.get_ffmpeg_binary()
     if configured_ffmpeg:
         audio_segment_cls.converter = configured_ffmpeg
+        audio_segment_cls.ffmpeg = configured_ffmpeg
+        os.environ["IMAGEIO_FFMPEG_EXE"] = configured_ffmpeg
 
 
 def mktimestamp(time_unit: float) -> str:
