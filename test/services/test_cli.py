@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -31,6 +32,45 @@ class TestCli(unittest.TestCase):
         self.assertEqual([m.url for m in materials], ["a.mp4", "b.jpg"])
         self.assertTrue(all(m.provider == "local" for m in materials))
         self.assertEqual(params.video_terms, ["foo", "bar"])
+
+    def test_build_video_params_splits_chinese_comma_terms(self):
+        args = cli.parse_args(
+            [
+                "--video-subject",
+                "中文关键词",
+                "--video-terms",
+                "广州城市天际线，重庆山城航拍, Shanghai skyline",
+            ]
+        )
+
+        params = cli.build_video_params(args)
+
+        self.assertEqual(
+            params.video_terms,
+            ["广州城市天际线", "重庆山城航拍", "Shanghai skyline"],
+        )
+
+    def test_build_video_params_can_read_script_and_terms_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_file = Path(temp_dir) / "script.txt"
+            terms_file = Path(temp_dir) / "terms.txt"
+            script_file.write_text("第一句。\n第二句。", encoding="utf-8")
+            terms_file.write_text("first city，second city", encoding="utf-8")
+
+            args = cli.parse_args(
+                [
+                    "--video-subject",
+                    "文件输入",
+                    "--video-script-file",
+                    str(script_file),
+                    "--video-terms-file",
+                    str(terms_file),
+                ]
+            )
+            params = cli.build_video_params(args)
+
+        self.assertEqual(params.video_script, "第一句。\n第二句。")
+        self.assertEqual(params.video_terms, ["first city", "second city"])
 
     def test_run_cli_dispatches_task_start(self):
         with patch.object(cli.tm, "start", return_value={"script": "ok"}) as start, patch.object(

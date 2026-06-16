@@ -35,28 +35,158 @@ def generate_script(task_id, params):
     return video_script
 
 
+def _normalize_video_terms(video_terms):
+    if not video_terms:
+        return []
+    if isinstance(video_terms, str):
+        if video_terms.startswith("Error: "):
+            return video_terms
+        return [term.strip() for term in re.split(r"[,，]", video_terms) if term.strip()]
+    if isinstance(video_terms, list):
+        return [str(term).strip() for term in video_terms if str(term).strip()]
+    raise ValueError("video_terms must be a string or a list of strings.")
+
+
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u3400-\u9fff]", text or ""))
+
+
+def _terms_contain_cjk(video_terms) -> bool:
+    if isinstance(video_terms, str):
+        return _contains_cjk(video_terms)
+    if isinstance(video_terms, list):
+        return any(_contains_cjk(str(term)) for term in video_terms)
+    return False
+
+
+_CJK_STOCK_SEARCH_TRANSLATIONS = [
+    ("常住人口", "city people"),
+    ("黄浦江", "Huangpu River"),
+    ("天安门", "Tiananmen"),
+    ("陆家嘴", "Lujiazui"),
+    ("小蛮腰", "Canton Tower"),
+    ("珠江", "Pearl River"),
+    ("长江", "Yangtze River"),
+    ("广州", "Guangzhou"),
+    ("重庆", "Chongqing"),
+    ("深圳", "Shenzhen"),
+    ("北京", "Beijing"),
+    ("上海", "Shanghai"),
+    ("中国", "China"),
+    ("航拍", "aerial"),
+    ("天际线", "skyline"),
+    ("夜景", "night"),
+    ("山城", "mountain city"),
+    ("科技", "technology"),
+    ("福田", "Futian"),
+    ("城市", "city"),
+    ("面积", "aerial city"),
+    ("人口", "people"),
+    ("商都", "commercial city"),
+]
+
+
+def _dedupe_adjacent_words(text: str) -> str:
+    words = text.split()
+    deduped = []
+    for word in words:
+        if not deduped or deduped[-1].lower() != word.lower():
+            deduped.append(word)
+    return " ".join(deduped)
+
+
+def _translate_cjk_stock_search_term(term: str) -> str:
+    if not _contains_cjk(term):
+        return term.strip()
+
+    translated = f" {term} "
+    for source, replacement in _CJK_STOCK_SEARCH_TRANSLATIONS:
+        translated = translated.replace(source, f" {replacement} ")
+
+    translated = re.sub(r"[\u3400-\u9fff]+", " ", translated)
+    translated = re.sub(r"[^\w\s.-]", " ", translated)
+    translated = re.sub(r"\s+", " ", translated).strip()
+    translated = _dedupe_adjacent_words(translated)
+    return translated or "China city skyline"
+
+
+def _translate_cjk_terms_for_stock_search(video_terms: list[str]) -> list[str]:
+    return [_translate_cjk_stock_search_term(term) for term in video_terms]
+
+
+def _uses_online_material_source(params) -> bool:
+    return params.video_source in {"pexels", "pixabay", "coverr"}
+
+
+def _resolve_voice_name_for_script(raw_voice_name: str, video_script: str) -> str:
+    parsed_voice_name = voice.parse_voice_name(raw_voice_name or "")
+    if voice.is_no_voice(raw_voice_name):
+        return parsed_voice_name
+
+    if _contains_cjk(video_script) and not parsed_voice_name.startswith(
+        ("zh-", "yue-")
+    ):
+        fallback_voice = "zh-CN-XiaoxiaoNeural"
+        logger.warning(
+            "Chinese script detected but selected voice is not Chinese, "
+            f"fallback to {fallback_voice}"
+        )
+        return fallback_voice
+
+    return parsed_voice_name
+
+
 def generate_terms(task_id, params, video_script):
     logger.info("\n\n## generating video terms")
-    video_terms = params.video_terms
+    script_lines = utils.split_script_to_visual_lines(video_script)
+    expected_term_count = len(script_lines) if params.match_materials_to_script else 5
+    video_terms = _normalize_video_terms(params.video_terms)
+    if isinstance(video_terms, str):
+        return video_terms
+    if _uses_online_material_source(params) and _terms_contain_cjk(video_terms):
+        if (
+            params.match_materials_to_script
+            and video_terms
+            and len(video_terms) != expected_term_count
+        ):
+            logger.warning(
+                "manual Chinese video terms count does not match script sentence "
+                "count, expected: "
+                f"{expected_term_count}, actual: {len(video_terms)}; regenerating"
+            )
+            video_terms = []
+        else:
+            logger.warning(
+                "manual video terms contain Chinese text, translating them to "
+                "English stock-video search terms"
+            )
+            video_terms = _translate_cjk_terms_for_stock_search(video_terms)
+
+    if (
+        params.match_materials_to_script
+        and video_terms
+        and len(video_terms) != expected_term_count
+    ):
+        logger.warning(
+            "manual video terms count does not match script sentence count, "
+            f"expected: {expected_term_count}, actual: {len(video_terms)}; regenerating"
+        )
+        video_terms = []
+
     if not video_terms:
-        # 开启素材按文案顺序匹配后，关键词本身也必须按脚本叙事顺序生成；
-        # 否则后续即使顺序下载和顺序拼接，也只能复用一组全局主题词，
-        # 无法改善“后面内容的画面提前出现”的问题。
         video_terms = llm.generate_terms(
             video_subject=params.video_subject,
             video_script=video_script,
-            amount=8 if params.match_materials_to_script else 5,
+            amount=expected_term_count,
             match_script_order=params.match_materials_to_script,
         )
-    else:
-        if isinstance(video_terms, str):
-            video_terms = [term.strip() for term in re.split(r"[,，]", video_terms)]
-        elif isinstance(video_terms, list):
-            video_terms = [term.strip() for term in video_terms]
-        else:
-            raise ValueError("video_terms must be a string or a list of strings.")
+        if isinstance(video_terms, str) and video_terms.startswith("Error: "):
+            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            logger.error(f"failed to generate video terms: {video_terms}")
+            return None
+        video_terms = _normalize_video_terms(video_terms)
 
-        logger.debug(f"video terms: {utils.to_json(video_terms)}")
+    logger.debug(f"video terms: {utils.to_json(video_terms)}")
 
     if not video_terms:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
@@ -66,13 +196,88 @@ def generate_terms(task_id, params, video_script):
     return video_terms
 
 
-def save_script_data(task_id, video_script, video_terms, params):
+def _parse_srt_time(time_value: str) -> float | None:
+    match = re.fullmatch(r"(\d+):(\d+):(\d+),(\d+)", (time_value or "").strip())
+    if not match:
+        return None
+    hours, minutes, seconds, milliseconds = match.groups()
+    return (
+        int(hours) * 3600
+        + int(minutes) * 60
+        + int(seconds)
+        + int(milliseconds.ljust(3, "0")[:3]) / 1000
+    )
+
+
+def _parse_srt_time_range(time_range: str) -> tuple[float, float] | None:
+    if not time_range or "-->" not in time_range:
+        return None
+    start_text, end_text = [part.strip() for part in time_range.split("-->", 1)]
+    start_time = _parse_srt_time(start_text)
+    end_time = _parse_srt_time(end_text)
+    if start_time is None or end_time is None or end_time <= start_time:
+        return None
+    return start_time, end_time
+
+
+def build_matched_segments(video_script, video_terms, subtitle_path):
+    if not subtitle_path:
+        return []
+
+    subtitle_items = subtitle.file_to_subtitles(subtitle_path)
+    if not subtitle_items:
+        return []
+
+    script_lines = utils.split_script_to_visual_lines(video_script)
+    terms = _normalize_video_terms(video_terms)
+    if isinstance(terms, str):
+        terms = []
+
+    matched_segments = []
+    for item_index, subtitle_item in enumerate(subtitle_items):
+        parsed_range = _parse_srt_time_range(subtitle_item[1])
+        if not parsed_range:
+            logger.warning(f"skip invalid subtitle time range: {subtitle_item[1]}")
+            continue
+
+        start_time, end_time = parsed_range
+        text = subtitle_item[2].strip()
+        if not text and item_index < len(script_lines):
+            text = script_lines[item_index]
+
+        term = ""
+        if item_index < len(terms):
+            term = terms[item_index]
+        elif terms:
+            term = terms[-1]
+        else:
+            term = text
+
+        matched_segments.append(
+            {
+                "index": len(matched_segments) + 1,
+                "text": text,
+                "term": term,
+                "start": round(start_time, 3),
+                "end": round(end_time, 3),
+                "duration": round(end_time - start_time, 3),
+                "material": "",
+            }
+        )
+
+    logger.info(f"built {len(matched_segments)} sentence-matched segments")
+    return matched_segments
+
+
+def save_script_data(task_id, video_script, video_terms, params, matched_segments=None):
     script_file = path.join(utils.task_dir(task_id), "script.json")
     script_data = {
         "script": video_script,
         "search_terms": video_terms,
         "params": params,
     }
+    if matched_segments is not None:
+        script_data["matched_segments"] = matched_segments
 
     with open(script_file, "w", encoding="utf-8") as f:
         f.write(utils.to_json(script_data))
@@ -103,7 +308,7 @@ def generate_audio(task_id, params, video_script):
         audio_file = path.join(utils.task_dir(task_id), "audio.mp3")
         sub_maker = voice.tts(
             text=video_script,
-            voice_name=voice.parse_voice_name(params.voice_name),
+            voice_name=_resolve_voice_name_for_script(params.voice_name, video_script),
             voice_rate=params.voice_rate,
             voice_file=audio_file,
         )
@@ -169,7 +374,21 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     return subtitle_path
 
 
-def get_video_materials(task_id, params, video_terms, audio_duration):
+def _assign_local_materials_to_segments(matched_segments, material_paths):
+    if not matched_segments or not material_paths:
+        return matched_segments
+
+    updated_segments = []
+    for index, segment in enumerate(matched_segments):
+        segment_info = dict(segment)
+        segment_info["material"] = material_paths[index % len(material_paths)]
+        segment_info["provider"] = "local"
+        segment_info["material_source_url"] = segment_info["material"]
+        updated_segments.append(segment_info)
+    return updated_segments
+
+
+def get_video_materials(task_id, params, video_terms, audio_duration, matched_segments=None):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
@@ -181,11 +400,29 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
                 "no valid materials found, please check the materials and try again."
             )
             return None
-        return [material_info.url for material_info in materials]
+        material_paths = [material_info.url for material_info in materials]
+        if params.match_materials_to_script and matched_segments:
+            matched_segments = _assign_local_materials_to_segments(
+                matched_segments, material_paths
+            )
+            return [segment["material"] for segment in matched_segments], matched_segments
+        return material_paths, matched_segments
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
-        # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
-        # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
+        if params.match_materials_to_script and matched_segments:
+            downloaded_videos, matched_segments = material.download_videos_for_segments(
+                task_id=task_id,
+                segments=matched_segments,
+                source=params.video_source,
+                video_aspect=params.video_aspect,
+                max_clip_duration=params.video_clip_duration,
+            )
+            if downloaded_videos:
+                return downloaded_videos, matched_segments
+            logger.warning(
+                "sentence-level material matching found no videos, fallback to ordered download"
+            )
+
         downloaded_videos = material.download_videos(
             task_id=task_id,
             search_terms=video_terms,
@@ -206,14 +443,19 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
                 "failed to download videos, maybe the network is not available. if you are in China, please use a VPN."
             )
             return None
-        return downloaded_videos
+        return downloaded_videos, matched_segments
 
 
 def generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path
+    task_id, params, downloaded_videos, audio_file, subtitle_path, matched_segments=None
 ):
     final_video_paths = []
     combined_video_paths = []
+    use_segment_matching = bool(
+        params.match_materials_to_script
+        and matched_segments
+        and all(segment.get("material") for segment in matched_segments)
+    )
     # 多视频生成默认会打散素材以增加差异；但“按文案顺序匹配素材”追求的是
     # 时间线稳定性和可解释性，所以开启后所有输出都使用顺序拼接。
     if params.match_materials_to_script:
@@ -231,16 +473,26 @@ def generate_final_videos(
             utils.task_dir(task_id), f"combined-{index}.mp4"
         )
         logger.info(f"\n\n## combining video: {index} => {combined_video_path}")
-        video.combine_videos(
-            combined_video_path=combined_video_path,
-            video_paths=downloaded_videos,
-            audio_file=audio_file,
-            video_aspect=params.video_aspect,
-            video_concat_mode=video_concat_mode,
-            video_transition_mode=video_transition_mode,
-            max_clip_duration=params.video_clip_duration,
-            threads=params.n_threads,
-        )
+        if use_segment_matching:
+            video.combine_videos_by_segments(
+                combined_video_path=combined_video_path,
+                segments=matched_segments,
+                audio_file=audio_file,
+                video_aspect=params.video_aspect,
+                video_transition_mode=video_transition_mode,
+                threads=params.n_threads,
+            )
+        else:
+            video.combine_videos(
+                combined_video_path=combined_video_path,
+                video_paths=downloaded_videos,
+                audio_file=audio_file,
+                video_aspect=params.video_aspect,
+                video_concat_mode=video_concat_mode,
+                video_transition_mode=video_transition_mode,
+                max_clip_duration=params.video_clip_duration,
+                threads=params.n_threads,
+            )
 
         _progress += 50 / params.video_count / 2
         sm.state.update_task(task_id, progress=_progress)
@@ -290,6 +542,13 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         if not video_terms:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
             return
+    elif params.match_materials_to_script and params.video_terms:
+        video_terms = _normalize_video_terms(params.video_terms)
+        if isinstance(video_terms, str):
+            logger.warning(
+                f"ignore invalid local video terms for segment matching: {video_terms}"
+            )
+            video_terms = []
 
     save_script_data(task_id, video_script, video_terms, params)
 
@@ -324,6 +583,18 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     subtitle_path = generate_subtitle(
         task_id, params, video_script, sub_maker, audio_file
     )
+    matched_segments = []
+    if params.match_materials_to_script:
+        matched_segments = build_matched_segments(
+            video_script=video_script,
+            video_terms=video_terms,
+            subtitle_path=subtitle_path,
+        )
+        if not matched_segments:
+            logger.warning(
+                "no valid subtitle timeline for sentence-level material matching, "
+                "fallback to ordered fixed-duration material matching"
+            )
 
     if stop_at == "subtitle":
         sm.state.update_task(
@@ -331,18 +602,31 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
             state=const.TASK_STATE_COMPLETE,
             progress=100,
             subtitle_path=subtitle_path,
+            matched_segments=matched_segments,
         )
-        return {"subtitle_path": subtitle_path}
+        return {"subtitle_path": subtitle_path, "matched_segments": matched_segments}
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
     # 5. Get video materials
-    downloaded_videos = get_video_materials(
-        task_id, params, video_terms, audio_duration
+    materials_result = get_video_materials(
+        task_id, params, video_terms, audio_duration, matched_segments
     )
+    downloaded_videos = None
+    if materials_result:
+        downloaded_videos, matched_segments = materials_result
     if not downloaded_videos:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
         return
+
+    if matched_segments:
+        save_script_data(
+            task_id,
+            video_script,
+            video_terms,
+            params,
+            matched_segments=matched_segments,
+        )
 
     if stop_at == "materials":
         sm.state.update_task(
@@ -350,8 +634,9 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
             state=const.TASK_STATE_COMPLETE,
             progress=100,
             materials=downloaded_videos,
+            matched_segments=matched_segments,
         )
-        return {"materials": downloaded_videos}
+        return {"materials": downloaded_videos, "matched_segments": matched_segments}
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=50)
 
@@ -362,7 +647,12 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
 
     # 6. Generate final videos
     final_video_paths, combined_video_paths = generate_final_videos(
-        task_id, params, downloaded_videos, audio_file, subtitle_path
+        task_id,
+        params,
+        downloaded_videos,
+        audio_file,
+        subtitle_path,
+        matched_segments,
     )
 
     if not final_video_paths:
@@ -399,6 +689,8 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         "materials": downloaded_videos,
         "cross_post_results": cross_post_results if cross_post_results else None,
     }
+    if matched_segments:
+        kwargs["matched_segments"] = matched_segments
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )

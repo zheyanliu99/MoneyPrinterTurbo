@@ -298,6 +298,7 @@ if not config.app.get("hide_config", False):
                 ("Grok", "grok"),
                 ("Groq", "groq"),
                 ("Ollama", "ollama"),
+                ("Codex CLI", "codex"),
                 ("G4f", "g4f"),
                 ("OneAPI", "oneapi"),
                 ("Cloudflare", "cloudflare"),
@@ -353,6 +354,27 @@ if not config.app.get("hide_config", False):
                                 - 如果 `MoneyPrinterTurbo` 和 `Ollama` **不在同一台机器上**，需要填写 `Ollama` 机器的IP地址
                                 - 如果 `MoneyPrinterTurbo` 是 `Docker` 部署，建议填写 `http://host.docker.internal:11434/v1`{docker_hint}
                             - **Model Name**: 使用 `ollama list` 查看，比如 `qwen:7b`
+                            """
+
+            if llm_provider == "codex":
+                if not llm_model_name:
+                    llm_model_name = config.app.get("codex_model_name", "")
+                if not config.app.get("codex_command"):
+                    config.app["codex_command"] = "codex"
+                if "codex_use_oss" not in config.app:
+                    config.app["codex_use_oss"] = True
+                if not config.app.get("codex_local_provider"):
+                    config.app["codex_local_provider"] = "ollama"
+                if not config.app.get("codex_timeout"):
+                    config.app["codex_timeout"] = 300
+
+                with llm_helper:
+                    tips = """
+                            ##### Codex CLI Configuration
+                            - **Command**: local Codex CLI command or full path
+                            - **Use OSS Provider**: enabled by default to avoid the OpenAI API path
+                            - **Local Provider**: `ollama` or `lmstudio`
+                            - **Model Name**: optional; leave empty to use the local provider default
                             """
 
             if llm_provider == "openai":
@@ -575,74 +597,114 @@ if not config.app.get("hide_config", False):
                     )
                 st.info(tips)
 
-            st_llm_api_key = st.text_input(
-                tr("API Key"), value=llm_api_key, type="password"
-            )
-            st_llm_base_url = st.text_input(tr("Base Url"), value=llm_base_url)
-            st_llm_model_name = ""
-            if llm_provider != "ernie":
-                if llm_provider == "groq":
-                    effective_api_key = st_llm_api_key or llm_api_key
-                    effective_base_url = st_llm_base_url or llm_base_url
-                    groq_models = get_groq_model_ids(
-                        api_key=effective_api_key,
-                        base_url=effective_base_url,
+            if llm_provider == "codex":
+                st_codex_command = st.text_input(
+                    "Codex Command",
+                    value=config.app.get("codex_command", "codex"),
+                )
+                st_codex_use_oss = st.checkbox(
+                    "Use local OSS provider",
+                    value=bool(config.app.get("codex_use_oss", True)),
+                )
+                codex_provider_options = ["ollama", "lmstudio"]
+                saved_codex_provider = config.app.get("codex_local_provider", "ollama")
+                codex_provider_index = 0
+                if saved_codex_provider in codex_provider_options:
+                    codex_provider_index = codex_provider_options.index(
+                        saved_codex_provider
                     )
+                st_codex_local_provider = st.selectbox(
+                    "Local Provider",
+                    options=codex_provider_options,
+                    index=codex_provider_index,
+                )
+                st_llm_model_name = st.text_input(
+                    tr("Model Name"),
+                    value=llm_model_name,
+                    key="codex_model_name_input",
+                )
+                st_codex_timeout = st.number_input(
+                    "Timeout (seconds)",
+                    min_value=30,
+                    max_value=3600,
+                    value=int(config.app.get("codex_timeout", 300) or 300),
+                    step=30,
+                )
 
-                    if groq_models:
-                        selected_index = 0
-                        if llm_model_name in groq_models:
-                            selected_index = groq_models.index(llm_model_name)
-
-                        st_llm_model_name = st.selectbox(
-                            tr("Model Name"),
-                            options=groq_models,
-                            index=selected_index,
-                            key="groq_model_name_select",
+                config.app["codex_command"] = st_codex_command
+                config.app["codex_use_oss"] = st_codex_use_oss
+                config.app["codex_local_provider"] = st_codex_local_provider
+                config.app["codex_timeout"] = int(st_codex_timeout)
+                config.app["codex_model_name"] = st_llm_model_name
+            else:
+                st_llm_api_key = st.text_input(
+                    tr("API Key"), value=llm_api_key, type="password"
+                )
+                st_llm_base_url = st.text_input(tr("Base Url"), value=llm_base_url)
+                st_llm_model_name = ""
+                if llm_provider != "ernie":
+                    if llm_provider == "groq":
+                        effective_api_key = st_llm_api_key or llm_api_key
+                        effective_base_url = st_llm_base_url or llm_base_url
+                        groq_models = get_groq_model_ids(
+                            api_key=effective_api_key,
+                            base_url=effective_base_url,
                         )
+
+                        if groq_models:
+                            selected_index = 0
+                            if llm_model_name in groq_models:
+                                selected_index = groq_models.index(llm_model_name)
+
+                            st_llm_model_name = st.selectbox(
+                                tr("Model Name"),
+                                options=groq_models,
+                                index=selected_index,
+                                key="groq_model_name_select",
+                            )
+                        else:
+                            st_llm_model_name = st.text_input(
+                                tr("Model Name"),
+                                value=llm_model_name,
+                                key="groq_model_name_input",
+                            )
+                            if effective_api_key:
+                                st.caption(
+                                    "Unable to load Groq model list right now. You can still enter a model name manually — note it won't be validated until generation."
+                                )
+                            else:
+                                st.caption(
+                                    "Add a Groq API key to load available models automatically."
+                                )
                     else:
                         st_llm_model_name = st.text_input(
                             tr("Model Name"),
                             value=llm_model_name,
-                            key="groq_model_name_input",
+                            key=f"{llm_provider}_model_name_input",
                         )
-                        if effective_api_key:
-                            st.caption(
-                                "Unable to load Groq model list right now. You can still enter a model name manually — note it won't be validated until generation."
-                            )
-                        else:
-                            st.caption(
-                                "Add a Groq API key to load available models automatically."
-                            )
+                    if st_llm_model_name:
+                        config.app[f"{llm_provider}_model_name"] = st_llm_model_name
                 else:
-                    st_llm_model_name = st.text_input(
-                        tr("Model Name"),
-                        value=llm_model_name,
-                        key=f"{llm_provider}_model_name_input",
-                    )
+                    st_llm_model_name = None
+
+                if st_llm_api_key:
+                    config.app[f"{llm_provider}_api_key"] = st_llm_api_key
+                if st_llm_base_url:
+                    config.app[f"{llm_provider}_base_url"] = st_llm_base_url
                 if st_llm_model_name:
                     config.app[f"{llm_provider}_model_name"] = st_llm_model_name
-            else:
-                st_llm_model_name = None
+                if llm_provider == "ernie":
+                    st_llm_secret_key = st.text_input(
+                        tr("Secret Key"), value=llm_secret_key, type="password"
+                    )
+                    config.app[f"{llm_provider}_secret_key"] = st_llm_secret_key
 
-            if st_llm_api_key:
-                config.app[f"{llm_provider}_api_key"] = st_llm_api_key
-            if st_llm_base_url:
-                config.app[f"{llm_provider}_base_url"] = st_llm_base_url
-            if st_llm_model_name:
-                config.app[f"{llm_provider}_model_name"] = st_llm_model_name
-            if llm_provider == "ernie":
-                st_llm_secret_key = st.text_input(
-                    tr("Secret Key"), value=llm_secret_key, type="password"
-                )
-                config.app[f"{llm_provider}_secret_key"] = st_llm_secret_key
-
-            if llm_provider == "cloudflare":
-                st_llm_account_id = st.text_input(
-                    tr("Account ID"), value=llm_account_id
-                )
-                if st_llm_account_id:
-                    config.app[f"{llm_provider}_account_id"] = st_llm_account_id
+                if llm_provider == "cloudflare":
+                    st_llm_account_id = st.text_input(
+                        tr("Account ID"), value=llm_account_id
+                    )
+                    if st_llm_account_id:
+                        config.app[f"{llm_provider}_account_id"] = st_llm_account_id
 
         # 右侧面板 - API 密钥设置
         with right_config_panel:

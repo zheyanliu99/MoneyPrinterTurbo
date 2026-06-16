@@ -577,6 +577,41 @@ class TestVoiceService(unittest.TestCase):
         self.assertEqual(len(sub_items), len(script_lines))
         self.assertIn("1,000 years", sub_items[-1])
 
+    def test_edge_cue_aggregation_carries_text_across_script_boundaries(self):
+        """
+        Edge cues may cross punctuation boundaries. When one cue includes the
+        start of the next script line, aggregation must consume the matched
+        prefix and carry the leftover text forward instead of getting stuck.
+        """
+        text = "6:30 AM, coffee first. Did the data land?"
+        script_lines = utils.split_string_by_punctuations(text)
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="6:30 AMcoffee",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=0.8),
+                ),
+                SimpleNamespace(
+                    content="firstDidthedata",
+                    start=timedelta(seconds=1),
+                    end=timedelta(seconds=1.8),
+                ),
+                SimpleNamespace(
+                    content="land",
+                    start=timedelta(seconds=2),
+                    end=timedelta(seconds=2.8),
+                ),
+            ]
+        )
+
+        sub_items = vs._build_subtitle_items_from_edge_cues(sub_maker, script_lines)
+
+        self.assertEqual(len(sub_items), len(script_lines))
+        self.assertIn("6:30 AM", sub_items[0])
+        self.assertIn("coffee first", sub_items[1])
+        self.assertIn("Did the data land", sub_items[2])
+
     def test_script_split_supports_arabic_punctuation(self):
         """
         阿拉伯语脚本常用 ، ؛ ؟ 作为自然断句标点。断句阶段必须识别这些

@@ -58,6 +58,7 @@ coverr_api_keys = []
 #   deepseek
 #   gemini
 #   ollama
+#   codex      (local Codex CLI; defaults to --oss with Ollama/LM Studio)
 #   g4f        (disabled by default; set enable_g4f=true only after accepting its risks)
 #   oneapi
 #   cloudflare
@@ -86,6 +87,23 @@ pollinations_model_name = "openai-fast"
 ollama_base_url = ""
 # Check your available models at https://ollama.com/library
 ollama_model_name = ""
+
+########## Codex CLI Settings
+# Uses the local Codex CLI as the text-generation backend.
+# By default this runs `codex exec --oss --local-provider ollama`, so generation
+# goes through your local OSS provider instead of the OpenAI API.
+# If the `codex` command is not on PATH, set the full CLI path, for example:
+# codex_command = "/Applications/Codex.app/Contents/Resources/codex"
+codex_command = "codex"
+# Set to false only if you intentionally want Codex to use its configured
+# non-OSS/default model/auth instead of a local OSS provider.
+codex_use_oss = true
+# Supported by Codex CLI: "ollama" or "lmstudio"
+codex_local_provider = "ollama"
+# Optional. Leave empty to let Codex/local provider use its configured default.
+codex_model_name = ""
+# Max seconds to wait for each Codex generation request.
+codex_timeout = 300
 
 ########## OpenAI API Key
 # Get your API key at https://platform.openai.com/api-keys

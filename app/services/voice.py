@@ -1237,6 +1237,50 @@ def _match_script_line(script_lines: list[str], current_text: str, sub_index: in
     return ""
 
 
+def _normalize_subtitle_match_text(text: str, normalize_arabic: bool = False) -> str:
+    if normalize_arabic:
+        text = _normalize_arabic(text)
+    return re.sub(r"[_\W]+", "", text)
+
+
+def _match_script_line_prefix(
+    script_lines: list[str], current_text: str, sub_index: int
+) -> str:
+    if len(script_lines) <= sub_index:
+        return ""
+
+    target_line = script_lines[sub_index]
+    current_text_normalized = _normalize_subtitle_match_text(current_text)
+    target_line_normalized = _normalize_subtitle_match_text(target_line)
+    if target_line_normalized and current_text_normalized.startswith(
+        target_line_normalized
+    ):
+        return target_line.strip()
+
+    current_ar = _normalize_subtitle_match_text(current_text, normalize_arabic=True)
+    target_ar = _normalize_subtitle_match_text(target_line, normalize_arabic=True)
+    if target_ar and current_ar.startswith(target_ar):
+        return target_line.strip()
+
+    return ""
+
+
+def _consume_subtitle_prefix(current_text: str, target_line: str) -> tuple[str, str]:
+    target_len = len(_normalize_subtitle_match_text(target_line))
+    if target_len <= 0:
+        return "", current_text
+
+    consumed_len = 0
+    for index, char in enumerate(current_text):
+        normalized_char = _normalize_subtitle_match_text(char)
+        if normalized_char:
+            consumed_len += len(normalized_char)
+        if consumed_len >= target_len:
+            return current_text[: index + 1], current_text[index + 1 :]
+
+    return current_text, ""
+
+
 def _write_subtitle_items(sub_items: list[str], subtitle_file: str) -> bool:
     """
     将已经聚合好的字幕段写入到 SRT 文件，并做一次基本可读性验证。
@@ -1294,21 +1338,31 @@ def _build_subtitle_items_from_edge_cues(
         current_end_time = int(cue.end.total_seconds() * 10000000)
         current_text += cue_text
 
-        matched_text = _match_script_line(script_lines, current_text, sub_index)
-        if not matched_text:
-            continue
+        while sub_index < len(script_lines):
+            matched_text = _match_script_line(script_lines, current_text, sub_index)
+            if matched_text:
+                remainder = ""
+            else:
+                matched_text = _match_script_line_prefix(
+                    script_lines, current_text, sub_index
+                )
+                if not matched_text:
+                    break
+                _, remainder = _consume_subtitle_prefix(
+                    current_text, script_lines[sub_index]
+                )
 
-        sub_index += 1
-        sub_items.append(
-            formatter(
-                idx=sub_index,
-                start_time=current_start_time,
-                end_time=current_end_time,
-                sub_text=matched_text,
+            sub_index += 1
+            sub_items.append(
+                formatter(
+                    idx=sub_index,
+                    start_time=current_start_time,
+                    end_time=current_end_time,
+                    sub_text=matched_text,
+                )
             )
-        )
-        current_text = ""
-        current_start_time = None
+            current_text = remainder
+            current_start_time = current_end_time if current_text.strip() else None
 
     if current_text.strip():
         logger.warning(

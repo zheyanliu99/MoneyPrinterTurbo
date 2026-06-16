@@ -178,6 +178,56 @@ class TestMaterialTlsVerification(unittest.TestCase):
         )
         self.assertEqual(result, ["/tmp/a1.mp4", "/tmp/b1.mp4", "/tmp/a2.mp4"])
 
+    def test_download_videos_for_segments_selects_one_material_per_segment(self):
+        """
+        逐句匹配模式下，每个字幕 segment 只拿一个素材；如果候选里有
+        未用过的 URL，优先使用未重复素材。完全搜不到时复用上一句素材。
+        """
+        shared = "https://v.example/shared.mp4"
+        middle = "https://v.example/middle.mp4"
+        search_results = {
+            "opening city": [
+                material.MaterialInfo(provider="pexels", url=shared, duration=5),
+            ],
+            "middle park": [
+                material.MaterialInfo(provider="pexels", url=shared, duration=5),
+                material.MaterialInfo(provider="pexels", url=middle, duration=5),
+            ],
+            "missing bridge": [],
+        }
+        downloaded_urls = []
+
+        def fake_search(search_term, minimum_duration, video_aspect):
+            return search_results[search_term]
+
+        def fake_save_video(video_url, save_dir=""):
+            downloaded_urls.append(video_url)
+            return f"/tmp/{video_url.rsplit('/', 1)[-1]}"
+
+        segments = [
+            {"index": 1, "term": "opening city", "duration": 3, "material": ""},
+            {"index": 2, "term": "middle park", "duration": 4, "material": ""},
+            {"index": 3, "term": "missing bridge", "duration": 5, "material": ""},
+        ]
+
+        with (
+            patch.dict(config.app, {"material_directory": ""}),
+            patch.object(material, "search_videos_pexels", side_effect=fake_search),
+            patch.object(material, "save_video", side_effect=fake_save_video),
+        ):
+            paths, matched_segments = material.download_videos_for_segments(
+                task_id="segment-materials",
+                segments=segments,
+                source="pexels",
+                max_clip_duration=3,
+            )
+
+        self.assertEqual(downloaded_urls, [shared, middle])
+        self.assertEqual(paths, ["/tmp/shared.mp4", "/tmp/middle.mp4", "/tmp/middle.mp4"])
+        self.assertEqual(matched_segments[0]["material"], "/tmp/shared.mp4")
+        self.assertEqual(matched_segments[1]["material"], "/tmp/middle.mp4")
+        self.assertEqual(matched_segments[2]["material"], "/tmp/middle.mp4")
+
 
 class TestCoverrProvider(unittest.TestCase):
     """

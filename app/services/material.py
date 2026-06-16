@@ -1,3 +1,4 @@
+import math
 import os
 import random
 import threading
@@ -381,6 +382,106 @@ def download_videos(
             logger.error(f"failed to download video: {utils.to_json(item)} => {str(e)}")
     logger.success(f"downloaded {len(video_paths)} videos")
     return video_paths
+
+
+def download_videos_for_segments(
+    task_id: str,
+    segments: List[dict],
+    source: str = "pexels",
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    max_clip_duration: int = 5,
+) -> tuple[List[str], List[dict]]:
+    search_videos = search_videos_pexels
+    if source == "pixabay":
+        search_videos = search_videos_pixabay
+    elif source == "coverr":
+        search_videos = search_videos_coverr
+
+    material_directory = config.app.get("material_directory", "").strip()
+    if material_directory == "task":
+        material_directory = utils.task_dir(task_id)
+    elif material_directory and not os.path.isdir(material_directory):
+        material_directory = ""
+
+    logger.info("downloading one video per script subtitle segment")
+    used_video_urls = set()
+    downloaded_paths = []
+    matched_segments = []
+    last_material_path = ""
+    last_source_url = ""
+
+    for segment in segments:
+        segment_info = dict(segment)
+        search_term = (segment_info.get("term") or segment_info.get("text") or "").strip()
+        segment_duration = max(float(segment_info.get("duration") or 0.0), 1.0)
+        minimum_duration = max(
+            1,
+            min(
+                int(math.ceil(segment_duration)),
+                int(max_clip_duration or math.ceil(segment_duration)),
+            ),
+        )
+
+        video_items = []
+        if search_term:
+            video_items = search_videos(
+                search_term=search_term,
+                minimum_duration=minimum_duration,
+                video_aspect=video_aspect,
+            )
+        logger.info(
+            f"found {len(video_items)} segment videos for '{search_term}', "
+            f"segment duration: {segment_duration:.2f}s"
+        )
+
+        unique_items = [item for item in video_items if item.url not in used_video_urls]
+        candidate_items = unique_items or video_items
+        saved_video_path = ""
+        selected_source_url = ""
+
+        for item in candidate_items:
+            try:
+                logger.info(
+                    f"downloading segment video for '{search_term}': {item.url}"
+                )
+                saved_video_path = save_video(
+                    video_url=item.url, save_dir=material_directory
+                )
+                if saved_video_path:
+                    selected_source_url = item.url
+                    used_video_urls.add(item.url)
+                    logger.info(f"segment video saved: {saved_video_path}")
+                    break
+            except Exception as e:
+                logger.error(
+                    f"failed to download segment video: {utils.to_json(item)} => {str(e)}"
+                )
+                saved_video_path = ""
+                selected_source_url = ""
+
+        if not saved_video_path and last_material_path:
+            logger.warning(
+                f"no material found for segment '{search_term}', reusing previous material"
+            )
+            saved_video_path = last_material_path
+            selected_source_url = last_source_url
+
+        if saved_video_path:
+            last_material_path = saved_video_path
+            last_source_url = selected_source_url
+            downloaded_paths.append(saved_video_path)
+            segment_info["material"] = saved_video_path
+            segment_info["material_source_url"] = selected_source_url
+            segment_info["provider"] = source
+        else:
+            segment_info["material"] = ""
+            segment_info["material_source_url"] = ""
+            segment_info["provider"] = source
+
+        matched_segments.append(segment_info)
+
+    logger.success(f"downloaded {len(downloaded_paths)} segment videos")
+    return downloaded_paths, matched_segments
 
 
 def _download_videos_by_script_order(

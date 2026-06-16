@@ -20,6 +20,7 @@ from moviepy import (
     TextClip,
     VideoFileClip,
     afx,
+    vfx,
 )
 from moviepy.video.tools.subtitles import SubtitlesClip
 from PIL import Image, ImageDraw, ImageFont
@@ -693,6 +694,188 @@ def combine_videos(
     delete_files(clip_files)
             
     logger.info("video combining completed")
+    return combined_video_path
+
+
+def _get_segment_float(segment: dict, key: str, default: float = 0.0) -> float:
+    try:
+        return float(segment.get(key, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_segment_visual_duration(
+    segments: List[dict],
+    index: int,
+    audio_duration: float,
+) -> float:
+    segment = segments[index]
+    subtitle_duration = _get_segment_float(segment, "duration", 0.0)
+    current_start = 0.0 if index == 0 else _get_segment_float(segment, "start", 0.0)
+
+    if index + 1 < len(segments):
+        next_start = _get_segment_float(segments[index + 1], "start", 0.0)
+        visual_duration = next_start - current_start
+    elif audio_duration > current_start:
+        visual_duration = audio_duration - current_start
+    else:
+        visual_duration = subtitle_duration
+
+    return max(subtitle_duration, visual_duration, 0.1)
+
+
+def _resize_clip_to_aspect(clip, video_width: int, video_height: int, clip_duration: float):
+    clip_w, clip_h = clip.size
+    if clip_w == video_width and clip_h == video_height:
+        return clip
+
+    clip_ratio = clip.w / clip.h
+    video_ratio = video_width / video_height
+    logger.debug(
+        f"resizing segment clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, "
+        f"target: {video_width}x{video_height}, ratio: {video_ratio:.2f}"
+    )
+
+    if clip_ratio == video_ratio:
+        return clip.resized(new_size=(video_width, video_height))
+
+    if clip_ratio > video_ratio:
+        scale_factor = video_width / clip_w
+    else:
+        scale_factor = video_height / clip_h
+
+    new_width = int(clip_w * scale_factor)
+    new_height = int(clip_h * scale_factor)
+    background = ColorClip(
+        size=(video_width, video_height),
+        color=(0, 0, 0),
+    ).with_duration(clip_duration)
+    clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
+    return CompositeVideoClip([background, clip_resized])
+
+
+def _apply_transition(clip, transition_value):
+    shuffle_side = random.choice(["left", "right", "top", "bottom"])
+    if transition_value in (None, VideoTransitionMode.none.value):
+        return clip
+    if transition_value == VideoTransitionMode.fade_in.value:
+        return video_effects.fadein_transition(clip, 1)
+    if transition_value == VideoTransitionMode.fade_out.value:
+        return video_effects.fadeout_transition(clip, 1)
+    if transition_value == VideoTransitionMode.slide_in.value:
+        return video_effects.slidein_transition(clip, 1, shuffle_side)
+    if transition_value == VideoTransitionMode.slide_out.value:
+        return video_effects.slideout_transition(clip, 1, shuffle_side)
+    if transition_value == VideoTransitionMode.shuffle.value:
+        transition_funcs = [
+            lambda c: video_effects.fadein_transition(c, 1),
+            lambda c: video_effects.fadeout_transition(c, 1),
+            lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
+            lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
+        ]
+        return random.choice(transition_funcs)(clip)
+    return clip
+
+
+def combine_videos_by_segments(
+    combined_video_path: str,
+    segments: List[dict],
+    audio_file: str,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    video_transition_mode: VideoTransitionMode = None,
+    threads: int = 2,
+) -> str:
+    audio_clip = AudioFileClip(audio_file)
+    try:
+        audio_duration = audio_clip.duration
+    finally:
+        close_clip(audio_clip)
+
+    valid_segments = [segment for segment in segments if segment.get("material")]
+    logger.info(
+        f"combining {len(valid_segments)} sentence-matched video segments, "
+        f"audio duration: {audio_duration:.2f}s"
+    )
+    if not valid_segments:
+        logger.warning("no sentence-matched segments available for combining")
+        return combined_video_path
+
+    transition_value = getattr(video_transition_mode, "value", video_transition_mode)
+    output_dir = os.path.dirname(combined_video_path)
+    aspect = VideoAspect(video_aspect)
+    video_width, video_height = aspect.to_resolution()
+    processed_clips = []
+
+    for index, segment in enumerate(valid_segments):
+        target_duration = _get_segment_visual_duration(
+            valid_segments, index, audio_duration
+        )
+        material_path = segment.get("material", "")
+        clip = None
+        try:
+            logger.debug(
+                f"processing matched segment {index + 1}: "
+                f"term={segment.get('term')}, duration={target_duration:.2f}s, "
+                f"material={material_path}"
+            )
+            clip = _open_video_clip_quietly(material_path)
+            source_duration = max(float(clip.duration or 0.0), 0.0)
+            if source_duration <= 0:
+                raise ValueError(f"invalid material duration: {material_path}")
+
+            if source_duration < target_duration:
+                clip = clip.with_effects([vfx.Loop(duration=target_duration)])
+            else:
+                clip = clip.subclipped(0, target_duration)
+            clip = clip.with_duration(target_duration)
+            clip = _resize_clip_to_aspect(
+                clip, video_width, video_height, target_duration
+            )
+            clip = _apply_transition(clip, transition_value)
+            clip = clip.with_duration(target_duration)
+
+            clip_file = f"{output_dir}/temp-segment-clip-{index + 1}.mp4"
+            _write_videofile_with_codec_fallback(
+                clip,
+                clip_file,
+                codec=_get_configured_video_codec(),
+                logger=None,
+                fps=fps,
+            )
+            processed_clips.append(
+                SubClippedVideoClip(
+                    file_path=clip_file,
+                    duration=target_duration,
+                    source_file_path=material_path,
+                )
+            )
+        except Exception as e:
+            logger.error(f"failed to process matched segment clip: {str(e)}")
+        finally:
+            if clip is not None:
+                close_clip(clip)
+
+    logger.info("starting sentence-matched clip merging process")
+    if not processed_clips:
+        logger.warning("no sentence-matched clips available for merging")
+        return combined_video_path
+
+    if len(processed_clips) == 1:
+        logger.info("using single sentence-matched clip directly")
+        shutil.copy(processed_clips[0].file_path, combined_video_path)
+        delete_files([processed_clips[0].file_path])
+        logger.info("sentence-matched video combining completed")
+        return combined_video_path
+
+    clip_files = [clip.file_path for clip in processed_clips]
+    concat_video_clips_with_ffmpeg(
+        clip_files=clip_files,
+        output_file=combined_video_path,
+        threads=threads,
+        output_dir=output_dir,
+    )
+    delete_files(clip_files)
+    logger.info("sentence-matched video combining completed")
     return combined_video_path
 
 

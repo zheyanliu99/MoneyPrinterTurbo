@@ -44,6 +44,7 @@ def generate_video_terms(request: Request, body: VideoTermsRequest):
         video_subject=body.video_subject,
         video_script=body.video_script,
         amount=body.amount,
+        match_script_order=body.match_script_order,
     )
     response = {"video_terms": video_terms}
     return utils.get_response(200, response)

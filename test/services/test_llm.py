@@ -120,8 +120,9 @@ class TestScriptPromptOptions(unittest.TestCase):
             )
 
         self.assertEqual(result, ["opening city", "middle office", "final sunset"])
-        self.assertIn("chronological stock-video search terms", captured["prompt"])
+        self.assertIn("exactly 3 chronological stock-video search terms", captured["prompt"])
         self.assertIn("same order as the script narration", captured["prompt"])
+        self.assertIn("return exactly 3 terms", captured["prompt"])
 
     def test_video_script_request_rejects_invalid_advanced_options(self):
         """
@@ -231,6 +232,83 @@ class TestLiteLLMProvider(unittest.TestCase):
         self.assertIn("Error:", result)
         self.assertIn("api_key is not set", result)
         self.assertNotIn("litellm", result.lower())
+
+    def _use_codex_provider(self, use_oss=True):
+        config.app["llm_provider"] = "codex"
+        config.app["codex_command"] = "codex"
+        config.app["codex_use_oss"] = use_oss
+        config.app["codex_local_provider"] = "ollama"
+        config.app["codex_model_name"] = "llama3"
+        config.app["codex_timeout"] = 120
+
+    def test_codex_provider_runs_local_oss_exec(self):
+        self._use_codex_provider()
+
+        def _run(args, **kwargs):
+            self.assertEqual(args[:4], ["codex", "--ask-for-approval", "never", "exec"])
+            self.assertIn("--ignore-user-config", args)
+            self.assertIn("--ephemeral", args)
+            self.assertIn("--ignore-rules", args)
+            self.assertIn("--oss", args)
+            self.assertIn("--local-provider", args)
+            self.assertIn("ollama", args)
+            self.assertIn("--model", args)
+            self.assertIn("llama3", args)
+            self.assertIn("--output-last-message", args)
+            output_path = Path(args[args.index("--output-last-message") + 1])
+            output_path.write_text("hello\ncodex", encoding="utf-8")
+            self.assertEqual(args[-1], "-")
+            self.assertEqual(kwargs["cwd"], config.root_dir)
+            self.assertEqual(kwargs["timeout"], 120)
+            self.assertIn("Say hello", kwargs["input"])
+            self.assertIn("Do not inspect files", kwargs["input"])
+            return types.SimpleNamespace(returncode=0, stdout="cli noise", stderr="")
+
+        with (
+            patch.object(llm.shutil, "which", return_value="/usr/local/bin/codex"),
+            patch.object(llm.subprocess, "run", side_effect=_run),
+        ):
+            result = llm._generate_response("Say hello")
+
+        self.assertEqual(result, "hellocodex")
+
+    def test_codex_provider_can_use_non_oss_codex_config(self):
+        self._use_codex_provider(use_oss=False)
+
+        def _run(args, **kwargs):
+            self.assertNotIn("--oss", args)
+            self.assertNotIn("--local-provider", args)
+            output_path = Path(args[args.index("--output-last-message") + 1])
+            output_path.write_text("hello", encoding="utf-8")
+            return types.SimpleNamespace(returncode=0, stdout="cli noise", stderr="")
+
+        with (
+            patch.object(llm.shutil, "which", return_value="/usr/local/bin/codex"),
+            patch.object(llm.subprocess, "run", side_effect=_run),
+        ):
+            result = llm._generate_response("Say hello")
+
+        self.assertEqual(result, "hello")
+
+    def test_codex_provider_reports_cli_errors(self):
+        self._use_codex_provider()
+
+        with (
+            patch.object(llm.shutil, "which", return_value="/usr/local/bin/codex"),
+            patch.object(
+                llm.subprocess,
+                "run",
+                return_value=types.SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="local provider is unavailable",
+                ),
+            ),
+        ):
+            result = llm._generate_response("Say hello")
+
+        self.assertIn("Error:", result)
+        self.assertIn("local provider is unavailable", result)
 
     def _use_qwen_provider(self):
         config.app["llm_provider"] = "qwen"

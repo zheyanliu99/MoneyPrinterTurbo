@@ -232,6 +232,11 @@ def split_string_by_punctuations(s):
             txt += char
             continue
 
+        if char == ":" and previous_char.isdigit() and next_char.isdigit():
+            # 时间表达里的冒号不是断句符，例如 "6:30 AM"。
+            txt += char
+            continue
+
         if char not in const.PUNCTUATIONS:
             txt += char
         else:
@@ -274,6 +279,17 @@ def normalize_script_for_subtitle_matching(video_script: str) -> str:
             f"removed markdown separator lines: {removed_separator_lines}"
         )
     return normalized_script
+
+
+def split_script_to_visual_lines(video_script: str) -> list[str]:
+    """
+    Return the script lines used for sentence-level visual matching.
+
+    This deliberately mirrors the subtitle matching path so search terms,
+    subtitle cues, and per-sentence material segments share the same boundaries.
+    """
+    normalized_script = normalize_script_for_subtitle_matching(video_script)
+    return split_string_by_punctuations(normalized_script)
 
 
 def md5(text):

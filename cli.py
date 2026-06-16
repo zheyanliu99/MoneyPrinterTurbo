@@ -1,6 +1,7 @@
 import argparse
 import json
 import re
+from pathlib import Path
 from typing import Sequence
 
 from loguru import logger
@@ -60,6 +61,14 @@ _TRANSITION_MODE_VALUES = {
 }
 
 
+def _split_list_arg(value: str) -> list[str]:
+    return [
+        item.strip()
+        for item in re.split(r"[,，]", value or "")
+        if item.strip()
+    ]
+
+
 def _transition_mode(value: str) -> str | None:
     normalized = value.strip().lower()
     if normalized not in _TRANSITION_MODE_VALUES:
@@ -85,7 +94,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--video-subject", required=True, help="video subject")
     parser.add_argument("--video-script", default="", help="custom script")
+    parser.add_argument(
+        "--video-script-file",
+        default="",
+        help="UTF-8 text file containing the custom script",
+    )
     parser.add_argument("--video-terms", default=None, help="comma-separated terms")
+    parser.add_argument(
+        "--video-terms-file",
+        default="",
+        help="UTF-8 text file containing comma-separated terms",
+    )
     parser.add_argument(
         "--video-language",
         default=None,
@@ -254,9 +273,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def build_video_params(args: argparse.Namespace) -> VideoParams:
+    video_script = args.video_script or ""
+    if args.video_script_file:
+        video_script = Path(args.video_script_file).read_text(encoding="utf-8").strip()
+
     video_terms = args.video_terms
+    if args.video_terms_file:
+        video_terms = Path(args.video_terms_file).read_text(encoding="utf-8").strip()
     if video_terms:
-        video_terms = [term.strip() for term in video_terms.split(",") if term.strip()]
+        video_terms = _split_list_arg(video_terms)
 
     video_materials = None
     materials_arg = args.video_materials or ""
@@ -270,7 +295,7 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
 
     params_kwargs = {
         "video_subject": args.video_subject,
-        "video_script": args.video_script,
+        "video_script": video_script,
         "video_terms": video_terms,
         "video_source": args.video_source,
         "video_materials": video_materials,

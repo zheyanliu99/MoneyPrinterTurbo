@@ -44,7 +44,7 @@
     "Clip Duration": "Maximum Duration of Video Clips (seconds)",
     "Number of Videos Generated Simultaneously": "Number of Videos Generated Simultaneously",
     "Match Materials to Script Order": "Match materials to script order",
-    "Match Materials to Script Order Help": "Disabled by default. Mainly applies to online material sources. When enabled, keywords are generated in script order and materials are downloaded/combined in that order to reduce visual mismatch with the current voiceover.",
+    "Match Materials to Script Order Help": "Disabled by default. Mainly applies to online material sources. When enabled, each subtitle sentence gets its own search keyword and visual segment, and the segment duration follows the subtitle timing instead of the fixed Clip Duration. Clip Duration is only used as a fallback/legacy maximum.",
     "Audio Settings": "**Audio Settings**",
     "Speech Synthesis": "Speech Synthesis Voice",
     "Speech Region": "Region(:red[Required，[Get Region](https://portal.azure.com/#view/Microsoft_Azure_ProjectOxford/CognitiveServicesHub/~/SpeechServices)])",

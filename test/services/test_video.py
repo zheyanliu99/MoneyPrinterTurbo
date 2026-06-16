@@ -440,6 +440,86 @@ class TestVideoService(unittest.TestCase):
                 )
                 self.assertEqual(result, combined_video_path)
 
+    def test_combine_videos_by_segments_uses_subtitle_timeline(self):
+        class _FakeAudioClip:
+            duration = 6.0
+
+            def close(self):
+                pass
+
+        class _FakeVideoClip:
+            def __init__(self, duration=20.0):
+                self.duration = duration
+                self.size = (1080, 1920)
+                self.w = 1080
+                self.h = 1920
+
+            def subclipped(self, start, end):
+                self.duration = end - start
+                return self
+
+            def with_effects(self, effects):
+                return self
+
+            def with_duration(self, duration):
+                self.duration = duration
+                return self
+
+            def resized(self, new_size):
+                self.size = new_size
+                self.w, self.h = new_size
+                return self
+
+            def with_position(self, position):
+                return self
+
+            def close(self):
+                pass
+
+        written_durations = []
+
+        def fake_write(clip, output_file, **kwargs):
+            written_durations.append(round(clip.duration, 2))
+
+        segments = [
+            {
+                "index": 1,
+                "term": "Statue of Liberty",
+                "start": 0.0,
+                "end": 2.0,
+                "duration": 2.0,
+                "material": "statue.mp4",
+            },
+            {
+                "index": 2,
+                "term": "Central Park",
+                "start": 3.5,
+                "end": 5.0,
+                "duration": 1.5,
+                "material": "park.mp4",
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            combined_video_path = os.path.join(temp_dir, "combined.mp4")
+            with (
+                patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()),
+                patch.object(vd, "_open_video_clip_quietly", return_value=_FakeVideoClip()),
+                patch.object(vd, "_write_videofile_with_codec_fallback", side_effect=fake_write),
+                patch.object(vd, "concat_video_clips_with_ffmpeg") as concat,
+                patch.object(vd, "delete_files"),
+            ):
+                result = vd.combine_videos_by_segments(
+                    combined_video_path=combined_video_path,
+                    segments=segments,
+                    audio_file="audio.mp3",
+                    video_transition_mode=None,
+                )
+
+        self.assertEqual(result, combined_video_path)
+        self.assertEqual(written_durations, [3.5, 2.5])
+        concat.assert_called_once()
+
     def test_prioritize_unique_source_clips_uses_each_source_before_reuse(self):
         """
         随机模式下，一个长素材会被拆成多个片段。调度层应先让每个源素材

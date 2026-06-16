@@ -1,7 +1,12 @@
 import json
 import logging
+import os
 import re
 import requests
+import shlex
+import shutil
+import subprocess
+import tempfile
 from typing import List
 
 from loguru import logger
@@ -9,6 +14,7 @@ from openai import AzureOpenAI, OpenAI
 from openai.types.chat import ChatCompletion
 
 from app.config import config
+from app.utils import utils
 
 _max_retries = 5
 _DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
@@ -116,11 +122,129 @@ def _extract_qwen_generation_text(response) -> str:
     return _normalize_text_response(text, "qwen")
 
 
+def _config_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _generate_codex_response(prompt: str) -> str:
+    codex_command = (config.app.get("codex_command") or "codex").strip()
+    command = shlex.split(codex_command)
+    if not command:
+        raise ValueError("codex: codex_command is not set")
+
+    executable = command[0]
+    if "/" not in executable and shutil.which(executable) is None:
+        raise ValueError(
+            "codex: command was not found. Set codex_command in config.toml "
+            "to the full path of the Codex CLI."
+        )
+
+    use_oss = _config_bool(config.app.get("codex_use_oss"), True)
+    local_provider = (config.app.get("codex_local_provider") or "ollama").strip()
+    model_name = (config.app.get("codex_model_name") or "").strip()
+    timeout = int(config.app.get("codex_timeout", 300) or 300)
+
+    args = [
+        *command,
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "--ignore-user-config",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--ignore-rules",
+        "--sandbox",
+        "read-only",
+        "--color",
+        "never",
+    ]
+
+    if use_oss:
+        if local_provider not in {"ollama", "lmstudio"}:
+            raise ValueError(
+                "codex: codex_local_provider must be either 'ollama' or 'lmstudio'"
+            )
+        args.append("--oss")
+        args.extend(["--local-provider", local_provider])
+
+    if model_name:
+        args.extend(["--model", model_name])
+
+    output_path = None
+    with tempfile.NamedTemporaryFile(
+        prefix="moneyprinterturbo-codex-",
+        suffix=".txt",
+        delete=False,
+    ) as output_file:
+        output_path = output_file.name
+
+    args.extend(["--output-last-message", output_path])
+    args.append("-")
+
+    codex_prompt = f"""
+You are being used as a local text-generation backend for MoneyPrinterTurbo.
+Answer the prompt below directly.
+Do not inspect files, run commands, edit files, browse the web, or mention Codex.
+Return only the content requested by the prompt.
+
+{prompt}
+""".strip()
+
+    logger.info(
+        "requesting codex exec completion, "
+        f"use_oss={use_oss}, local_provider={local_provider}, "
+        f"model={model_name or '<default>'}"
+    )
+
+    try:
+        try:
+            completed = subprocess.run(
+                args,
+                input=codex_prompt,
+                capture_output=True,
+                cwd=config.root_dir,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise TimeoutError(f"codex: request timed out after {timeout} seconds") from e
+
+        if completed.returncode != 0:
+            stderr = (completed.stderr or "").strip()
+            stdout = (completed.stdout or "").strip()
+            detail = stderr or stdout or f"exit code {completed.returncode}"
+            raise RuntimeError(f"codex: request failed: {detail}")
+
+        final_output = ""
+        if output_path and os.path.exists(output_path):
+            with open(output_path, "r", encoding="utf-8") as output_file:
+                final_output = output_file.read()
+        if not final_output.strip():
+            final_output = completed.stdout.strip()
+
+        return _normalize_text_response(final_output, "codex")
+    finally:
+        if output_path:
+            try:
+                os.unlink(output_path)
+            except OSError:
+                logger.warning(f"failed to delete temporary Codex output: {output_path}")
+
+
 def _generate_response(prompt: str) -> str:
     try:
         content = ""
         llm_provider = config.app.get("llm_provider", "openai")
         logger.info(f"llm provider: {llm_provider}")
+        if llm_provider == "codex":
+            return _generate_codex_response(prompt)
         if llm_provider == "g4f":
             if not config.app.get("enable_g4f", False):
                 raise ValueError(
@@ -725,13 +849,17 @@ def generate_terms(
     match_script_order: bool = False,
 ) -> List[str]:
     if match_script_order:
+        script_lines = utils.split_script_to_visual_lines(video_script)
+        if script_lines:
+            amount = len(script_lines)
         goal = (
-            f"Generate {amount} chronological stock-video search terms that follow "
-            "the order of topics in the video script."
+            f"Generate exactly {amount} chronological stock-video search terms, "
+            "one for each sentence in the video script."
         )
         ordering_rule = (
             "6. keep the terms in the same order as the script narration; "
-            "earlier terms must describe earlier visual moments."
+            "earlier terms must describe earlier visual moments.\n"
+            f"7. return exactly {amount} terms; do not merge or skip script sentences."
         )
         # 有序关键词模式下，示例数量要和 amount 保持一致，避免模型被固定
         # 的 4 个示例误导，导致长文案只返回少量关键词，影响素材覆盖度。
@@ -800,6 +928,13 @@ Please note that you must use English for generating video search terms; Chinese
             ):
                 logger.error("response is not a list of strings.")
                 continue
+            search_terms = [term.strip() for term in search_terms if term.strip()]
+            if match_script_order and amount > 0 and len(search_terms) != amount:
+                logger.warning(
+                    "ordered video terms count does not match script lines, "
+                    f"expected: {amount}, actual: {len(search_terms)}"
+                )
+                continue
 
         except Exception as e:
             logger.warning(f"failed to generate video terms: {str(e)}")
@@ -818,6 +953,13 @@ Please note that you must use English for generating video search terms; Chinese
             break
         if i < _max_retries:
             logger.warning(f"failed to generate video terms, trying again... {i + 1}")
+
+    if match_script_order and amount > 0 and search_terms:
+        if len(search_terms) > amount:
+            search_terms = search_terms[:amount]
+        elif len(search_terms) < amount:
+            fallback_term = search_terms[-1] if search_terms else video_subject
+            search_terms.extend([fallback_term] * (amount - len(search_terms)))
 
     logger.success(f"completed: \n{search_terms}")
     return search_terms
