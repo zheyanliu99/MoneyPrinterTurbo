@@ -52,7 +52,15 @@ class _Config:
 class MaterialInfo:
     provider: str = "pexels"
     url: str = ""
-    duration: int = 0
+    duration: float = 0.0
+    width: int = 0
+    height: int = 0
+    thumbnail_url: str = ""
+    source_page_url: str = ""
+    score: float = 0.0
+    relevance_score: float = 0.0
+    quality_score: float = 0.0
+    reason: str = ""
 
 
 class VideoParams(BaseModel):

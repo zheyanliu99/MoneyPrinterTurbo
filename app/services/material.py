@@ -1,13 +1,17 @@
 import math
 import os
 import random
+import re
 import threading
-from typing import List
-from urllib.parse import urlencode
+from io import BytesIO
+from typing import Any, Callable, List
+from urllib.parse import unquote, urlencode
 
+import numpy as np
 import requests
 from loguru import logger
 from moviepy.video.io.VideoFileClip import VideoFileClip
+from PIL import Image
 
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
@@ -16,6 +20,23 @@ from app.utils import utils
 # Thread-safe counter for API key rotation
 _api_key_counter = 0
 _api_key_lock = threading.Lock()
+_CANDIDATE_SEARCH_LIMIT = 10
+_DEFAULT_THUMBNAIL_TIMEOUT = 1.0
+_MAX_THUMBNAIL_TIMEOUT = 10.0
+_STOPWORDS = {
+    "and",
+    "are",
+    "for",
+    "from",
+    "into",
+    "near",
+    "over",
+    "show",
+    "that",
+    "the",
+    "this",
+    "with",
+}
 
 
 def _get_tls_verify() -> bool:
@@ -53,10 +74,70 @@ def get_api_key(cfg_key: str):
         return api_keys[_api_key_counter % len(api_keys)]
 
 
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_score(value: float) -> float:
+    return max(0.0, min(float(value), 100.0))
+
+
+def _candidate_thumbnail_timeout() -> float:
+    timeout = _safe_float(
+        config.app.get("candidate_thumbnail_timeout", _DEFAULT_THUMBNAIL_TIMEOUT),
+        _DEFAULT_THUMBNAIL_TIMEOUT,
+    )
+    return max(0.1, min(timeout, _MAX_THUMBNAIL_TIMEOUT))
+
+
+def _select_pexels_video_file(
+    video_files: list[dict],
+    target_width: int,
+    target_height: int,
+    exact_resolution: bool,
+) -> dict | None:
+    usable_files = [
+        video for video in video_files or [] if isinstance(video, dict) and video.get("link")
+    ]
+    if exact_resolution:
+        for video in usable_files:
+            if (
+                _safe_int(video.get("width")) == target_width
+                and _safe_int(video.get("height")) == target_height
+            ):
+                return video
+        return None
+
+    def quality_key(video: dict):
+        width = _safe_int(video.get("width"))
+        height = _safe_int(video.get("height"))
+        area = width * height
+        fps = _safe_int(video.get("fps"))
+        ratio = width / height if width and height else 0
+        target_ratio = target_width / target_height if target_height else ratio
+        aspect_gap = abs(math.log(ratio / target_ratio)) if ratio and target_ratio else 9
+        return area, fps, -aspect_gap
+
+    return max(usable_files, key=quality_key, default=None)
+
+
 def search_videos_pexels(
     search_term: str,
     minimum_duration: int,
     video_aspect: VideoAspect = VideoAspect.portrait,
+    per_page: int = _CANDIDATE_SEARCH_LIMIT,
+    exact_resolution: bool = True,
+    use_orientation_filter: bool = True,
 ) -> List[MaterialInfo]:
     aspect = VideoAspect(video_aspect)
     video_orientation = aspect.name
@@ -67,7 +148,10 @@ def search_videos_pexels(
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
     }
     # Build URL
-    params = {"query": search_term, "per_page": 20, "orientation": video_orientation}
+    per_page = max(1, min(int(per_page or _CANDIDATE_SEARCH_LIMIT), 80))
+    params = {"query": search_term, "per_page": per_page}
+    if use_orientation_filter:
+        params["orientation"] = video_orientation
     query_url = f"https://api.pexels.com/videos/search?{urlencode(params)}"
     logger.info(f"searching videos: {query_url}, with proxies: {config.proxy}")
 
@@ -87,22 +171,30 @@ def search_videos_pexels(
         videos = response["videos"]
         # loop through each video in the result
         for v in videos:
-            duration = v["duration"]
+            duration = float(v.get("duration") or 0)
             # check if video has desired minimum duration
             if duration < minimum_duration:
                 continue
-            video_files = v["video_files"]
-            # loop through each url to determine the best quality
-            for video in video_files:
-                w = int(video["width"])
-                h = int(video["height"])
-                if w == video_width and h == video_height:
-                    item = MaterialInfo()
-                    item.provider = "pexels"
-                    item.url = video["link"]
-                    item.duration = duration
-                    video_items.append(item)
-                    break
+            video_files = v.get("video_files") or []
+            selected_video = _select_pexels_video_file(
+                video_files=video_files,
+                target_width=video_width,
+                target_height=video_height,
+                exact_resolution=exact_resolution,
+            )
+            if not selected_video:
+                continue
+
+            item = MaterialInfo()
+            item.provider = "pexels"
+            item.url = str(selected_video.get("link") or "")
+            item.duration = duration
+            item.width = _safe_int(selected_video.get("width"))
+            item.height = _safe_int(selected_video.get("height"))
+            item.thumbnail_url = str(v.get("image") or "")
+            item.source_page_url = str(v.get("url") or "")
+            if item.url:
+                video_items.append(item)
         return video_items
     except Exception as e:
         logger.error(f"search videos failed: {str(e)}")
@@ -488,6 +580,340 @@ def download_videos_for_segments(
     return downloaded_paths, matched_segments
 
 
+def _metadata_text_for_candidate(item: MaterialInfo) -> str:
+    text = " ".join(
+        [
+            item.source_page_url or "",
+            item.thumbnail_url or "",
+            item.url or "",
+        ]
+    )
+    return re.sub(r"[^a-z0-9]+", " ", unquote(text).lower()).strip()
+
+
+def _keyword_tokens(*parts: str) -> list[str]:
+    tokens = []
+    seen = set()
+    for token in re.findall(r"[a-z0-9]+", " ".join(parts).lower()):
+        if len(token) <= 2 or token in _STOPWORDS or token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tokens
+
+
+def _metadata_relevance_score(
+    item: MaterialInfo,
+    search_term: str,
+    segment_text: str,
+    original_index: int,
+) -> tuple[float, str]:
+    metadata_text = _metadata_text_for_candidate(item)
+    page_text = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        unquote(item.source_page_url or "").lower(),
+    ).strip()
+    search_tokens = _keyword_tokens(search_term)
+    context_tokens = _keyword_tokens(search_term, segment_text)
+    phrase = " ".join(search_tokens)
+
+    if not context_tokens:
+        return _clamp_score(65.0 - (original_index * 0.5)), "ranked by source order"
+
+    matched_search = [token for token in search_tokens if token in metadata_text]
+    matched_context = [token for token in context_tokens if token in metadata_text]
+    matched_page = [token for token in search_tokens if token in page_text]
+
+    search_coverage = (
+        len(matched_search) / len(search_tokens) if search_tokens else 0.0
+    )
+    context_coverage = len(matched_context) / len(context_tokens)
+    phrase_bonus = 14.0 if phrase and phrase in metadata_text else 0.0
+    page_bonus = min(len(matched_page) * 4.0, 12.0)
+    order_bonus = max(0.0, 8.0 - (original_index * 0.35))
+    score = (
+        28.0
+        + (search_coverage * 42.0)
+        + (context_coverage * 14.0)
+        + phrase_bonus
+        + page_bonus
+        + order_bonus
+    )
+
+    if matched_search:
+        reason = f"matches {', '.join(matched_search[:3])} metadata"
+    elif matched_context:
+        reason = f"context match on {', '.join(matched_context[:3])}"
+    else:
+        reason = "no strong keyword match in URLs"
+    if phrase_bonus:
+        reason = f"{reason}; exact phrase"
+    return _clamp_score(score), reason
+
+
+def _score_thumbnail_image(image: Image.Image) -> tuple[float, str]:
+    image = image.convert("RGB")
+    image.thumbnail((192, 192), Image.Resampling.LANCZOS)
+    arr = np.asarray(image, dtype=np.float32)
+    if arr.size == 0 or arr.ndim != 3:
+        return 50.0, "thumbnail unavailable"
+
+    luminance = (
+        (arr[:, :, 0] * 0.299) + (arr[:, :, 1] * 0.587) + (arr[:, :, 2] * 0.114)
+    )
+    brightness = float(np.mean(luminance) / 255.0)
+    contrast = float(np.std(luminance))
+    hist, _ = np.histogram(luminance, bins=64, range=(0, 255))
+    if hist.sum() > 0:
+        probabilities = hist.astype(np.float64) / hist.sum()
+        probabilities = probabilities[probabilities > 0]
+        entropy = float(-(probabilities * np.log2(probabilities)).sum())
+    else:
+        entropy = 0.0
+
+    if luminance.shape[0] > 1 and luminance.shape[1] > 1:
+        sharpness_metric = float(
+            np.mean(np.abs(np.diff(luminance, axis=1)))
+            + np.mean(np.abs(np.diff(luminance, axis=0)))
+        )
+    else:
+        sharpness_metric = 0.0
+    color_variance = float(np.mean(np.std(arr.reshape(-1, 3), axis=0)))
+
+    brightness_score = _clamp_score(100.0 - (abs(brightness - 0.52) * 230.0))
+    contrast_score = _clamp_score((contrast / 64.0) * 100.0)
+    entropy_score = _clamp_score((entropy / 6.0) * 100.0)
+    sharpness_score = _clamp_score((sharpness_metric / 28.0) * 100.0)
+    color_score = _clamp_score((color_variance / 64.0) * 100.0)
+
+    score = (
+        brightness_score * 0.20
+        + contrast_score * 0.22
+        + entropy_score * 0.26
+        + sharpness_score * 0.22
+        + color_score * 0.10
+    )
+    if brightness < 0.08 and contrast < 14.0:
+        return min(score, 18.0), "thumbnail appears too dark"
+    if brightness > 0.93 and contrast < 16.0:
+        return min(score, 22.0), "thumbnail appears over-bright"
+    if sharpness_score < 25.0:
+        return _clamp_score(score), "thumbnail has limited sharpness"
+    return _clamp_score(score), "thumbnail has usable contrast and sharpness"
+
+
+def _thumbnail_visual_score(item: MaterialInfo) -> tuple[float, str]:
+    if not item.thumbnail_url:
+        return 50.0, "no thumbnail available"
+
+    timeout = _candidate_thumbnail_timeout()
+    try:
+        response = requests.get(
+            item.thumbnail_url,
+            proxies=config.proxy,
+            verify=_get_tls_verify(),
+            timeout=(min(2.0, timeout), timeout),
+        )
+        if hasattr(response, "raise_for_status"):
+            response.raise_for_status()
+        with Image.open(BytesIO(response.content)) as image:
+            return _score_thumbnail_image(image)
+    except Exception as e:
+        logger.debug(
+            f"thumbnail scoring skipped for {item.thumbnail_url}: {str(e)}"
+        )
+        return 50.0, "thumbnail unavailable"
+
+
+def _quality_score_for_candidate(
+    item: MaterialInfo,
+    video_aspect: VideoAspect,
+    minimum_duration: int,
+    already_used: bool,
+) -> tuple[float, str]:
+    width = _safe_int(item.width)
+    height = _safe_int(item.height)
+    duration = _safe_float(item.duration)
+    area = width * height
+    target_width, target_height = VideoAspect(video_aspect).to_resolution()
+    target_area = target_width * target_height
+    target_ratio = target_width / target_height if target_height else 0
+    ratio = width / height if width and height else 0
+
+    resolution_score = min(area / target_area, 1.0) * 100.0 if area else 45.0
+    duration_score = min(duration / max(minimum_duration, 1), 1.0) * 100.0
+    if ratio and target_ratio:
+        aspect_gap = abs(math.log(ratio / target_ratio))
+        aspect_score = max(45.0, 100.0 - min(aspect_gap * 55.0, 55.0))
+    else:
+        aspect_score = 60.0
+    source_score = 100.0 if item.source_page_url or item.thumbnail_url else 70.0
+
+    score = (
+        resolution_score * 0.40
+        + duration_score * 0.25
+        + aspect_score * 0.25
+        + source_score * 0.10
+    )
+    if already_used:
+        score -= 25.0
+
+    reason_bits = []
+    if width and height:
+        reason_bits.append(f"{width}x{height}")
+    if duration:
+        reason_bits.append(f"{duration:.1f}s")
+    if aspect_score < 75.0:
+        reason_bits.append("resizes to fit")
+    if already_used:
+        reason_bits.append("duplicate lowered")
+
+    return _clamp_score(score), ", ".join(reason_bits)
+
+
+def _candidate_record_for_item(
+    item: MaterialInfo,
+    candidate_id: str,
+    search_term: str,
+    segment_text: str,
+    video_aspect: VideoAspect,
+    minimum_duration: int,
+    used_video_urls: set,
+    original_index: int,
+) -> dict[str, Any]:
+    already_used = bool(item.url and item.url in used_video_urls)
+    quality_score, quality_reason = _quality_score_for_candidate(
+        item=item,
+        video_aspect=video_aspect,
+        minimum_duration=minimum_duration,
+        already_used=already_used,
+    )
+    relevance_value, relevance_reason = _metadata_relevance_score(
+        item=item,
+        search_term=search_term,
+        segment_text=segment_text,
+        original_index=original_index,
+    )
+    visual_score, visual_reason = _thumbnail_visual_score(item)
+    reason_bits = [relevance_reason]
+    if quality_reason:
+        reason_bits.append(quality_reason)
+    if visual_reason and visual_reason not in {
+        "thumbnail unavailable",
+        "no thumbnail available",
+    }:
+        reason_bits.append(visual_reason)
+
+    return {
+        "candidate_id": candidate_id,
+        "item": item,
+        "original_index": original_index,
+        "quality_score": quality_score,
+        "relevance_score": relevance_value,
+        "keyword_score": relevance_value,
+        "visual_score": visual_score,
+        "score": _clamp_score(
+            (relevance_value * 0.50)
+            + (quality_score * 0.30)
+            + (visual_score * 0.20)
+        ),
+        "reason": "; ".join(bit for bit in reason_bits if bit),
+    }
+
+
+def _dedupe_video_items(video_items: List[MaterialInfo]) -> List[MaterialInfo]:
+    deduped_items = []
+    seen_urls = set()
+    for item in video_items:
+        if not item.url or item.url in seen_urls:
+            continue
+        seen_urls.add(item.url)
+        deduped_items.append(item)
+    return deduped_items
+
+
+def _rank_candidate_items(
+    search_term: str,
+    segment_text: str,
+    video_items: List[MaterialInfo],
+    video_aspect: VideoAspect,
+    minimum_duration: int,
+    used_video_urls: set,
+    segment_index: int,
+    candidates_per_segment: int,
+) -> List[dict[str, Any]]:
+    ordered_items = _dedupe_video_items(video_items)[:_CANDIDATE_SEARCH_LIMIT]
+    ordered_items = [item for item in ordered_items if item.url not in used_video_urls] + [
+        item for item in ordered_items if item.url in used_video_urls
+    ]
+
+    records = [
+        _candidate_record_for_item(
+            item=item,
+            candidate_id=f"seg-{segment_index}-raw-{index + 1}",
+            search_term=search_term,
+            segment_text=segment_text,
+            video_aspect=video_aspect,
+            minimum_duration=minimum_duration,
+            used_video_urls=used_video_urls,
+            original_index=index,
+        )
+        for index, item in enumerate(ordered_items)
+    ]
+    if not records:
+        return []
+
+    for record in records:
+        record["score"] = _clamp_score(
+            (record["relevance_score"] * 0.50)
+            + (record["quality_score"] * 0.30)
+            + (record["visual_score"] * 0.20)
+        )
+        if not record["reason"]:
+            record["reason"] = "matched by search metadata and quality heuristics"
+
+    return sorted(
+        records,
+        key=lambda record: (
+            -record["score"],
+            -record["relevance_score"],
+            -record["quality_score"],
+            -record["visual_score"],
+            record["original_index"],
+        ),
+    )[:candidates_per_segment]
+
+
+def _candidate_payload_from_record(
+    record: dict[str, Any],
+    segment_index: int,
+    rank: int,
+    fallback: bool = False,
+) -> dict:
+    item: MaterialInfo = record["item"]
+    return {
+        "candidate_id": f"seg-{segment_index}-cand-{rank}",
+        "rank": rank,
+        "provider": item.provider or "pexels",
+        "material": "",
+        "source_url": item.url,
+        "preview_url": item.url,
+        "duration": float(item.duration or 0),
+        "width": int(item.width or 0),
+        "height": int(item.height or 0),
+        "thumbnail_url": item.thumbnail_url or "",
+        "source_page_url": item.source_page_url or "",
+        "score": round(float(record.get("score") or 0.0), 2),
+        "relevance_score": round(float(record.get("relevance_score") or 0.0), 2),
+        "keyword_score": round(float(record.get("keyword_score") or 0.0), 2),
+        "quality_score": round(float(record.get("quality_score") or 0.0), 2),
+        "visual_score": round(float(record.get("visual_score") or 0.0), 2),
+        "reason": str(record.get("reason") or "").strip(),
+        "fallback": fallback,
+    }
+
+
 def download_candidate_videos_for_segments(
     task_id: str,
     segments: List[dict],
@@ -495,6 +921,7 @@ def download_candidate_videos_for_segments(
     video_aspect: VideoAspect = VideoAspect.portrait,
     max_clip_duration: int = 5,
     candidates_per_segment: int = 3,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> tuple[List[str], List[dict]]:
     """
     Prepare multiple remote preview candidates for each subtitle/script segment.
@@ -510,11 +937,18 @@ def download_candidate_videos_for_segments(
     updated_segments: List[dict] = []
     used_video_urls = set()
     last_candidates: List[dict] = []
+    total_segments = len(segments)
 
-    for segment in segments:
+    for segment_number, segment in enumerate(segments, start=1):
         segment_info = dict(segment)
         segment_index = int(segment_info.get("index") or len(updated_segments) + 1)
         search_term = (segment_info.get("term") or segment_info.get("text") or "").strip()
+        if progress_callback:
+            progress_callback(
+                segment_number - 1,
+                total_segments,
+                f"正在搜索第 {segment_number}/{total_segments} 句：{search_term or '未命名片段'}",
+            )
         segment_duration = max(float(segment_info.get("duration") or 0.0), 1.0)
         minimum_duration = max(
             1,
@@ -529,36 +963,35 @@ def download_candidate_videos_for_segments(
                 search_term=search_term,
                 minimum_duration=minimum_duration,
                 video_aspect=video_aspect,
+                per_page=_CANDIDATE_SEARCH_LIMIT,
+                exact_resolution=False,
+                use_orientation_filter=False,
             )
         logger.info(
             f"found {len(video_items)} candidate videos for '{search_term}', "
             f"segment duration: {segment_duration:.2f}s"
         )
 
-        ordered_items = [item for item in video_items if item.url not in used_video_urls]
-        ordered_items.extend(item for item in video_items if item.url in used_video_urls)
-
         candidates = []
-        for item in ordered_items:
-            if len(candidates) >= candidates_per_segment:
-                break
-            if not item.url:
-                continue
-            used_video_urls.add(item.url)
-            candidates.append(
-                {
-                    "candidate_id": (
-                        f"seg-{segment_index}-cand-{len(candidates) + 1}"
-                    ),
-                    "rank": len(candidates) + 1,
-                    "provider": "pexels",
-                    "material": "",
-                    "source_url": item.url,
-                    "preview_url": item.url,
-                    "duration": float(item.duration or 0),
-                    "fallback": False,
-                }
+        ranked_records = _rank_candidate_items(
+            search_term=search_term,
+            segment_text=str(segment_info.get("text") or ""),
+            video_items=video_items,
+            video_aspect=video_aspect,
+            minimum_duration=minimum_duration,
+            used_video_urls=used_video_urls,
+            segment_index=segment_index,
+            candidates_per_segment=candidates_per_segment,
+        )
+        for rank, record in enumerate(ranked_records, start=1):
+            candidate = _candidate_payload_from_record(
+                record=record,
+                segment_index=segment_index,
+                rank=rank,
+                fallback=False,
             )
+            used_video_urls.add(candidate["source_url"])
+            candidates.append(candidate)
 
         if not candidates and last_candidates:
             logger.warning(
@@ -571,6 +1004,9 @@ def download_candidate_videos_for_segments(
                 )
                 fallback_candidate["rank"] = len(candidates) + 1
                 fallback_candidate["fallback"] = True
+                fallback_candidate["reason"] = (
+                    "reused previous segment candidate because no new candidates were found"
+                )
                 candidates.append(fallback_candidate)
                 if len(candidates) >= candidates_per_segment:
                     break
@@ -589,6 +1025,12 @@ def download_candidate_videos_for_segments(
 
         segment_info["candidates"] = candidates
         updated_segments.append(segment_info)
+        if progress_callback:
+            progress_callback(
+                segment_number,
+                total_segments,
+                f"已准备第 {segment_number}/{total_segments} 句候选素材",
+            )
 
     candidate_count = sum(
         len(segment.get("candidates") or []) for segment in updated_segments

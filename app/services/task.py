@@ -4,6 +4,7 @@ import os.path
 import re
 import shutil
 from os import path
+from typing import Callable
 
 from loguru import logger
 
@@ -13,6 +14,19 @@ from app.models.schema import VideoConcatMode, VideoParams
 from app.services import llm, material, subtitle, video, voice, upload_post
 from app.services import state as sm
 from app.utils import utils
+
+
+def _emit_progress(
+    progress_callback: Callable[[float, str], None] | None,
+    progress: float,
+    message: str,
+):
+    if not progress_callback:
+        return
+    try:
+        progress_callback(max(0.0, min(float(progress), 1.0)), message)
+    except Exception as exc:
+        logger.warning(f"progress callback failed: {str(exc)}")
 
 
 def generate_script(task_id, params):
@@ -730,6 +744,7 @@ def _prepare_candidates_from_timeline(
     audio_duration,
     subtitle_path,
     matched_segments,
+    progress_callback=None,
 ):
     if params.video_source != "pexels":
         raise ValueError("candidate editor currently supports Pexels only.")
@@ -738,9 +753,19 @@ def _prepare_candidates_from_timeline(
             "candidate editor needs a valid subtitle timeline. Enable subtitles and TTS."
         )
 
+    _emit_progress(progress_callback, 0.35, "正在切分每句音频...")
     matched_segments, audio_tail_pause = _write_audio_segment_files(
         task_id, audio_file, matched_segments
     )
+
+    def _candidate_progress(current: int, total: int, message: str):
+        total = max(total, 1)
+        _emit_progress(
+            progress_callback,
+            0.40 + (max(current, 0) / total) * 0.55,
+            message,
+        )
+
     _, matched_segments = material.download_candidate_videos_for_segments(
         task_id=task_id,
         segments=matched_segments,
@@ -748,6 +773,7 @@ def _prepare_candidates_from_timeline(
         video_aspect=params.video_aspect,
         max_clip_duration=params.video_clip_duration,
         candidates_per_segment=3,
+        progress_callback=_candidate_progress,
     )
     first_segment = matched_segments[0] if matched_segments else {}
     if not first_segment.get("candidates"):
@@ -791,14 +817,16 @@ def _prepare_candidates_from_timeline(
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )
+    _emit_progress(progress_callback, 1.0, "候选素材准备完成")
     return kwargs
 
 
-def _render_selection_impl(task_id, selections):
+def _render_selection_impl(task_id, selections, progress_callback=None):
     logger.info(f"rendering selected candidates for task: {task_id}")
     selections = [_selection_to_dict(selection) for selection in selections]
     if not selections:
         raise ValueError("render selection requires at least one selected segment.")
+    _emit_progress(progress_callback, 0.03, "正在检查候选选择...")
 
     script_data = _read_script_data(task_id)
     params = _coerce_video_params(script_data.get("params") or {})
@@ -836,9 +864,16 @@ def _render_selection_impl(task_id, selections):
     selected_segments = []
     selected_material_paths = []
     url_to_path = {}
-    for segment_index in sorted(segment_by_index):
+    ordered_segment_indexes = sorted(segment_by_index)
+    total_segments = max(len(ordered_segment_indexes), 1)
+    for render_index, segment_index in enumerate(ordered_segment_indexes, start=1):
         segment = segment_by_index[segment_index]
         selection = selections_by_index[segment_index]
+        _emit_progress(
+            progress_callback,
+            0.08 + ((render_index - 1) / total_segments) * 0.32,
+            f"正在下载第 {render_index}/{total_segments} 句选中素材...",
+        )
         candidates = segment.get("candidates") or []
         candidate_map = {
             str(candidate.get("candidate_id")): candidate for candidate in candidates
@@ -895,6 +930,11 @@ def _render_selection_impl(task_id, selections):
         )
         selected_segments.append(segment_info)
         selected_material_paths.append(local_material_path)
+        _emit_progress(
+            progress_callback,
+            0.08 + (render_index / total_segments) * 0.32,
+            f"已准备第 {render_index}/{total_segments} 句视频素材",
+        )
 
     sm.state.update_task(
         task_id,
@@ -912,8 +952,13 @@ def _render_selection_impl(task_id, selections):
     edited_audio_dir = path.join(utils.task_dir(task_id), "edited_audio_segments")
     os.makedirs(edited_audio_dir, exist_ok=True)
 
-    for segment in selected_segments:
+    for audio_index, segment in enumerate(selected_segments, start=1):
         segment_index = int(segment.get("index") or len(edited_segments) + 1)
+        _emit_progress(
+            progress_callback,
+            0.42 + ((audio_index - 1) / total_segments) * 0.22,
+            f"正在重建第 {audio_index}/{total_segments} 句音频...",
+        )
         audio_segment_info = segment.get("audio_segment") or {}
         pause_before = max(float(audio_segment_info.get("pause_before") or 0.0), 0.0)
         if pause_before > 0:
@@ -966,6 +1011,11 @@ def _render_selection_impl(task_id, selections):
             "original_text": selected_text,
         }
         edited_segments.append(edited_segment)
+        _emit_progress(
+            progress_callback,
+            0.42 + (audio_index / total_segments) * 0.22,
+            f"已重建第 {audio_index}/{total_segments} 句音频",
+        )
 
     tail_pause = max(float(script_data.get("audio_tail_pause") or 0.0), 0.0)
     if tail_pause > 0:
@@ -984,6 +1034,7 @@ def _render_selection_impl(task_id, selections):
         matched_segments=edited_segments,
         requires_selection=False,
     )
+    _emit_progress(progress_callback, 0.70, "正在合成最终视频...")
 
     downloaded_videos = [segment["material"] for segment in edited_segments]
     final_video_paths, combined_video_paths = generate_final_videos(
@@ -1003,6 +1054,7 @@ def _render_selection_impl(task_id, selections):
             extra_paths=[edited_audio_dir],
         )
         return
+    _emit_progress(progress_callback, 0.95, "正在整理输出文件...")
 
     script_file_extra = {
         "audio_file": edited_audio_file,
@@ -1043,12 +1095,13 @@ def _render_selection_impl(task_id, selections):
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )
+    _emit_progress(progress_callback, 1.0, "最终视频已生成")
     return kwargs
 
 
-def render_selection(task_id, selections):
+def render_selection(task_id, selections, progress_callback=None):
     try:
-        return _render_selection_impl(task_id, selections)
+        return _render_selection_impl(task_id, selections, progress_callback)
     except Exception as exc:
         logger.exception(f"failed to render selected candidates: {str(exc)}")
         sm.state.update_task(
@@ -1060,9 +1113,10 @@ def render_selection(task_id, selections):
         return
 
 
-def start(task_id, params: VideoParams, stop_at: str = "video"):
+def start(task_id, params: VideoParams, stop_at: str = "video", progress_callback=None):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
+    _emit_progress(progress_callback, 0.03, "正在生成脚本...")
 
     # 1. Generate script
     video_script = generate_script(task_id, params)
@@ -1071,6 +1125,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         return
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10)
+    _emit_progress(progress_callback, 0.10, "脚本已完成，正在生成关键词...")
 
     if stop_at == "script":
         sm.state.update_task(
@@ -1094,6 +1149,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
             video_terms = []
 
     save_script_data(task_id, video_script, video_terms, params)
+    _emit_progress(progress_callback, 0.20, "关键词已完成，正在生成配音...")
 
     if stop_at == "terms":
         sm.state.update_task(
@@ -1112,6 +1168,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         return
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=30)
+    _emit_progress(progress_callback, 0.30, "配音已完成，正在生成字幕...")
 
     if stop_at == "audio":
         sm.state.update_task(
@@ -1138,6 +1195,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
                 "no valid subtitle timeline for sentence-level material matching, "
                 "fallback to ordered fixed-duration material matching"
             )
+    _emit_progress(progress_callback, 0.34, "字幕已完成，正在准备候选素材...")
 
     if stop_at == "subtitle":
         sm.state.update_task(
@@ -1166,6 +1224,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
                 audio_duration=audio_duration,
                 subtitle_path=subtitle_path,
                 matched_segments=matched_segments,
+                progress_callback=progress_callback,
             )
         except Exception as exc:
             logger.exception(f"failed to prepare candidate materials: {str(exc)}")

@@ -323,6 +323,36 @@ def _show_video_preview(video_path: str, caption: str = ""):
         logger.warning(f"failed to render video preview: {video_path}, error: {e}")
 
 
+def _build_progress_updater(initial_message: str):
+    progress_bar = st.progress(0)
+    progress_text = st.empty()
+
+    def update(progress: float, message: str):
+        progress_value = max(0.0, min(float(progress or 0.0), 1.0))
+        progress_bar.progress(progress_value)
+        progress_text.caption(f"{int(progress_value * 100):02d}% · {message}")
+
+    update(0.0, initial_message)
+    return update
+
+
+def _candidate_preview_caption(candidate: dict) -> str:
+    parts = [f"候选 {candidate.get('rank')}"]
+    score = candidate.get("score")
+    if score is not None:
+        try:
+            parts.append(f"评分 {float(score):.0f}")
+        except (TypeError, ValueError):
+            pass
+    width = int(candidate.get("width") or 0)
+    height = int(candidate.get("height") or 0)
+    if width and height:
+        parts.append(f"{width}x{height}")
+    if candidate.get("fallback"):
+        parts.append("fallback")
+    return " · ".join(parts)
+
+
 def _load_candidate_task(task_id: str):
     if not task_id:
         return None
@@ -359,11 +389,10 @@ def _render_candidate_editor(task_data: dict):
                         candidate.get("preview_url")
                         or candidate.get("source_url")
                         or candidate.get("material", ""),
-                        caption=(
-                            f"候选 {candidate.get('rank')}"
-                            + (" · fallback" if candidate.get("fallback") else "")
-                        ),
+                        caption=_candidate_preview_caption(candidate),
                     )
+                    if candidate.get("reason"):
+                        st.caption(candidate["reason"])
 
             default_candidate_id = candidates[0].get("candidate_id", "")
             selected_candidate_id = st.radio(
@@ -374,8 +403,7 @@ def _render_candidate_editor(task_data: dict):
                 horizontal=True,
                 format_func=lambda candidate_id, items=candidates: next(
                     (
-                        f"候选 {item.get('rank')}"
-                        + (" · 复用" if item.get("fallback") else "")
+                        _candidate_preview_caption(item)
                         for item in items
                         if item.get("candidate_id") == candidate_id
                     ),
@@ -547,12 +575,20 @@ def _render_simple_editor():
 
         task_id = str(uuid4())
         st.session_state["candidate_task_id"] = task_id
+        progress_update = _build_progress_updater("准备开始...")
         with st.spinner("正在生成音频、字幕，并为每句准备在线候选视频..."):
-            tm.start(task_id=task_id, params=params, stop_at="candidates")
+            tm.start(
+                task_id=task_id,
+                params=params,
+                stop_at="candidates",
+                progress_callback=progress_update,
+            )
         task_data = _load_candidate_task(task_id) or {}
         if task_data.get("state") == -1:
+            progress_update(1.0, "准备候选素材失败")
             st.error(task_data.get("error", "准备候选素材失败。"))
         else:
+            progress_update(1.0, "候选素材准备完成")
             st.session_state["candidate_task_data"] = task_data
             st.success("候选素材准备完成，可以逐句选择和裁剪。")
 
@@ -571,13 +607,20 @@ def _render_simple_editor():
             st.error("请先准备候选素材，并完成每句视频选择。")
             st.stop()
 
+        progress_update = _build_progress_updater("准备开始渲染...")
         with st.spinner("正在按你的选择重建音频、字幕并渲染视频..."):
-            tm.render_selection(task_id=task_id, selections=selections)
+            tm.render_selection(
+                task_id=task_id,
+                selections=selections,
+                progress_callback=progress_update,
+            )
         task_data = _load_candidate_task(task_id) or {}
         st.session_state["candidate_task_data"] = task_data
         if task_data.get("state") == -1:
+            progress_update(1.0, "渲染失败")
             st.error(task_data.get("error", "渲染失败。"))
         else:
+            progress_update(1.0, "最终视频已生成")
             st.success("最终视频已生成。")
 
     latest_task = st.session_state.get("candidate_task_data") or {}
