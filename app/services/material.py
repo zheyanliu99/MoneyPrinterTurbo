@@ -322,7 +322,9 @@ def download_videos(
     if material_directory == "task":
         material_directory = utils.task_dir(task_id)
     elif material_directory and not os.path.isdir(material_directory):
-        material_directory = ""
+        material_directory = os.path.join(utils.task_dir(task_id), "render_materials")
+    elif not material_directory:
+        material_directory = os.path.join(utils.task_dir(task_id), "render_materials")
 
     if match_script_order:
         return _download_videos_by_script_order(
@@ -401,7 +403,9 @@ def download_videos_for_segments(
     if material_directory == "task":
         material_directory = utils.task_dir(task_id)
     elif material_directory and not os.path.isdir(material_directory):
-        material_directory = ""
+        material_directory = os.path.join(utils.task_dir(task_id), "render_materials")
+    elif not material_directory:
+        material_directory = os.path.join(utils.task_dir(task_id), "render_materials")
 
     logger.info("downloading one video per script subtitle segment")
     used_video_urls = set()
@@ -493,7 +497,7 @@ def download_candidate_videos_for_segments(
     candidates_per_segment: int = 3,
 ) -> tuple[List[str], List[dict]]:
     """
-    Download multiple local preview candidates for each subtitle/script segment.
+    Prepare multiple remote preview candidates for each subtitle/script segment.
 
     The first editor version is intentionally Pexels-only so selection metadata can
     stay predictable. Other providers continue to use the legacy automatic flow.
@@ -501,11 +505,8 @@ def download_candidate_videos_for_segments(
     if source != "pexels":
         raise ValueError("candidate editor currently supports Pexels only.")
 
-    logger.info("downloading editable Pexels candidates for script segments")
-    candidate_root = os.path.join(utils.task_dir(task_id), "candidates")
-    os.makedirs(candidate_root, exist_ok=True)
+    logger.info("preparing editable Pexels candidates for script segments")
 
-    downloaded_paths: List[str] = []
     updated_segments: List[dict] = []
     used_video_urls = set()
     last_candidates: List[dict] = []
@@ -522,9 +523,6 @@ def download_candidate_videos_for_segments(
                 int(max_clip_duration or math.ceil(segment_duration)),
             ),
         )
-        segment_dir = os.path.join(candidate_root, f"segment-{segment_index:03d}")
-        os.makedirs(segment_dir, exist_ok=True)
-
         video_items = []
         if search_term:
             video_items = search_videos_pexels(
@@ -544,33 +542,23 @@ def download_candidate_videos_for_segments(
         for item in ordered_items:
             if len(candidates) >= candidates_per_segment:
                 break
-            try:
-                logger.info(
-                    f"downloading candidate {len(candidates) + 1} for "
-                    f"segment {segment_index}: {item.url}"
-                )
-                saved_video_path = save_video(video_url=item.url, save_dir=segment_dir)
-                if not saved_video_path:
-                    continue
-                used_video_urls.add(item.url)
-                downloaded_paths.append(saved_video_path)
-                candidates.append(
-                    {
-                        "candidate_id": (
-                            f"seg-{segment_index}-cand-{len(candidates) + 1}"
-                        ),
-                        "rank": len(candidates) + 1,
-                        "provider": "pexels",
-                        "material": saved_video_path,
-                        "source_url": item.url,
-                        "duration": float(item.duration or 0),
-                        "fallback": False,
-                    }
-                )
-            except Exception as e:
-                logger.error(
-                    f"failed to download candidate video: {utils.to_json(item)} => {str(e)}"
-                )
+            if not item.url:
+                continue
+            used_video_urls.add(item.url)
+            candidates.append(
+                {
+                    "candidate_id": (
+                        f"seg-{segment_index}-cand-{len(candidates) + 1}"
+                    ),
+                    "rank": len(candidates) + 1,
+                    "provider": "pexels",
+                    "material": "",
+                    "source_url": item.url,
+                    "preview_url": item.url,
+                    "duration": float(item.duration or 0),
+                    "fallback": False,
+                }
+            )
 
         if not candidates and last_candidates:
             logger.warning(
@@ -589,22 +577,27 @@ def download_candidate_videos_for_segments(
 
         if candidates:
             last_candidates = [dict(candidate) for candidate in candidates]
-            segment_info["material"] = candidates[0]["material"]
+            segment_info["material"] = ""
             segment_info["material_source_url"] = candidates[0]["source_url"]
+            segment_info["preview_url"] = candidates[0]["preview_url"]
             segment_info["provider"] = "pexels"
         else:
             segment_info["material"] = ""
             segment_info["material_source_url"] = ""
+            segment_info["preview_url"] = ""
             segment_info["provider"] = "pexels"
 
         segment_info["candidates"] = candidates
         updated_segments.append(segment_info)
 
+    candidate_count = sum(
+        len(segment.get("candidates") or []) for segment in updated_segments
+    )
     logger.success(
-        f"downloaded {len(downloaded_paths)} editable candidate videos for "
+        f"prepared {candidate_count} editable remote candidate videos for "
         f"{len(updated_segments)} segments"
     )
-    return downloaded_paths, updated_segments
+    return [], updated_segments
 
 
 def _download_videos_by_script_order(

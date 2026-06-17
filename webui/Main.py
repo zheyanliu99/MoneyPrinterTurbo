@@ -336,7 +336,7 @@ def _render_candidate_editor(task_data: dict):
         return
 
     st.subheader("逐句候选素材")
-    st.caption("每一句字幕对应一个关键词和最多三条 Pexels 候选视频。选择视频后可以设置裁剪起止。")
+    st.caption("每一句字幕对应一个关键词和最多三条 Pexels 候选视频。候选素材直接使用在线链接预览，渲染时只临时下载你选中的视频。")
     selections = []
 
     for segment in matched_segments:
@@ -356,7 +356,9 @@ def _render_candidate_editor(task_data: dict):
             for preview_col, candidate in zip(preview_cols, candidates):
                 with preview_col:
                     _show_video_preview(
-                        candidate.get("material", ""),
+                        candidate.get("preview_url")
+                        or candidate.get("source_url")
+                        or candidate.get("material", ""),
                         caption=(
                             f"候选 {candidate.get('rank')}"
                             + (" · fallback" if candidate.get("fallback") else "")
@@ -545,7 +547,7 @@ def _render_simple_editor():
 
         task_id = str(uuid4())
         st.session_state["candidate_task_id"] = task_id
-        with st.spinner("正在生成音频、字幕，并为每句下载 3 条候选视频..."):
+        with st.spinner("正在生成音频、字幕，并为每句准备在线候选视频..."):
             tm.start(task_id=task_id, params=params, stop_at="candidates")
         task_data = _load_candidate_task(task_id) or {}
         if task_data.get("state") == -1:

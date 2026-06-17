@@ -2,6 +2,7 @@ import json
 import math
 import os.path
 import re
+import shutil
 from os import path
 
 from loguru import logger
@@ -602,6 +603,124 @@ def generate_final_videos(
     return final_video_paths, combined_video_paths
 
 
+def _remove_path_quietly(file_or_dir: str):
+    if not file_or_dir:
+        return
+    try:
+        if path.isdir(file_or_dir):
+            shutil.rmtree(file_or_dir, ignore_errors=True)
+        elif path.exists(file_or_dir):
+            os.remove(file_or_dir)
+    except Exception as exc:
+        logger.warning(f"failed to remove temporary artifact: {file_or_dir}, error: {str(exc)}")
+
+
+def _cleanup_final_only_artifacts(
+    task_id: str,
+    material_paths=None,
+    combined_video_paths=None,
+    extra_paths=None,
+):
+    task_root = utils.task_dir(task_id)
+    protected_paths = {
+        path.realpath(file_path)
+        for file_path in (combined_video_paths or [])
+        if file_path
+    }
+
+    for file_path in material_paths or []:
+        if not file_path or file_path.startswith(("http://", "https://")):
+            continue
+        real_file_path = path.realpath(file_path)
+        if real_file_path in protected_paths:
+            continue
+        if real_file_path.startswith(path.realpath(task_root) + os.sep):
+            _remove_path_quietly(real_file_path)
+
+    for file_path in combined_video_paths or []:
+        _remove_path_quietly(file_path)
+
+    for file_path in extra_paths or []:
+        _remove_path_quietly(file_path)
+
+    for temp_dir in (
+        path.join(task_root, "render_materials"),
+        path.join(task_root, "selected_materials"),
+        path.join(task_root, "candidates"),
+    ):
+        _remove_path_quietly(temp_dir)
+
+
+def _materialize_remote_candidate(candidate: dict, task_id: str, url_to_path: dict) -> str:
+    material_path = candidate.get("material") or ""
+    if material_path and not material_path.startswith(("http://", "https://")):
+        if path.exists(material_path):
+            return material_path
+
+    source_url = candidate.get("source_url") or candidate.get("preview_url") or ""
+    if not source_url:
+        raise ValueError("selected candidate is missing source_url")
+    if source_url in url_to_path:
+        return url_to_path[source_url]
+
+    material_dir = path.join(utils.task_dir(task_id), "selected_materials")
+    saved_path = material.save_video(video_url=source_url, save_dir=material_dir)
+    if not saved_path:
+        raise ValueError(f"failed to download selected candidate: {source_url}")
+    url_to_path[source_url] = saved_path
+    return saved_path
+
+
+def _strip_task_local_materials(task_id: str, segments):
+    if not segments:
+        return segments
+    task_root = path.realpath(utils.task_dir(task_id))
+    sanitized_segments = []
+
+    def is_task_local_file(file_path: str) -> bool:
+        if not file_path or file_path.startswith(("http://", "https://")):
+            return False
+        return path.realpath(file_path).startswith(task_root + os.sep)
+
+    for segment in segments:
+        if not isinstance(segment, dict):
+            sanitized_segments.append(segment)
+            continue
+        sanitized_segment = dict(segment)
+        source_url = (
+            sanitized_segment.get("material_source_url")
+            or sanitized_segment.get("preview_url")
+            or ""
+        )
+        if is_task_local_file(sanitized_segment.get("material") or ""):
+            sanitized_segment["material"] = ""
+        if source_url and not sanitized_segment.get("preview_url"):
+            sanitized_segment["preview_url"] = source_url
+
+        candidates = sanitized_segment.get("candidates")
+        if isinstance(candidates, list):
+            sanitized_candidates = []
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    sanitized_candidates.append(candidate)
+                    continue
+                sanitized_candidate = dict(candidate)
+                candidate_url = (
+                    sanitized_candidate.get("source_url")
+                    or sanitized_candidate.get("preview_url")
+                    or ""
+                )
+                if is_task_local_file(sanitized_candidate.get("material") or ""):
+                    sanitized_candidate["material"] = ""
+                if candidate_url and not sanitized_candidate.get("preview_url"):
+                    sanitized_candidate["preview_url"] = candidate_url
+                sanitized_candidates.append(sanitized_candidate)
+            sanitized_segment["candidates"] = sanitized_candidates
+
+        sanitized_segments.append(sanitized_segment)
+    return sanitized_segments
+
+
 def _prepare_candidates_from_timeline(
     task_id,
     params,
@@ -622,7 +741,7 @@ def _prepare_candidates_from_timeline(
     matched_segments, audio_tail_pause = _write_audio_segment_files(
         task_id, audio_file, matched_segments
     )
-    candidate_paths, matched_segments = material.download_candidate_videos_for_segments(
+    _, matched_segments = material.download_candidate_videos_for_segments(
         task_id=task_id,
         segments=matched_segments,
         source="pexels",
@@ -652,6 +771,12 @@ def _prepare_candidates_from_timeline(
         matched_segments=matched_segments,
         extra=extra,
     )
+    remote_candidate_urls = []
+    for segment in matched_segments:
+        for candidate in segment.get("candidates") or []:
+            source_url = candidate.get("source_url") or candidate.get("preview_url")
+            if source_url and source_url not in remote_candidate_urls:
+                remote_candidate_urls.append(source_url)
 
     kwargs = {
         "script": video_script,
@@ -659,7 +784,7 @@ def _prepare_candidates_from_timeline(
         "audio_file": audio_file,
         "audio_duration": audio_duration,
         "subtitle_path": subtitle_path,
-        "materials": candidate_paths,
+        "materials": remote_candidate_urls,
         "matched_segments": matched_segments,
         "requires_selection": True,
     }
@@ -709,6 +834,8 @@ def _render_selection_impl(task_id, selections):
         raise ValueError(f"missing selections for segments: {missing_indexes}")
 
     selected_segments = []
+    selected_material_paths = []
+    url_to_path = {}
     for segment_index in sorted(segment_by_index):
         segment = segment_by_index[segment_index]
         selection = selections_by_index[segment_index]
@@ -744,11 +871,21 @@ def _render_selection_impl(task_id, selections):
                 )
 
         selected_text = (selection.get("text") or segment.get("text") or "").strip()
+        local_material_path = _materialize_remote_candidate(
+            candidate=candidate,
+            task_id=task_id,
+            url_to_path=url_to_path,
+        )
         segment_info = dict(segment)
         segment_info["text"] = selected_text
         segment_info["candidate_id"] = candidate_id
-        segment_info["material"] = candidate["material"]
-        segment_info["material_source_url"] = candidate.get("source_url", "")
+        segment_info["material"] = local_material_path
+        segment_info["material_source_url"] = (
+            candidate.get("source_url") or candidate.get("preview_url") or ""
+        )
+        segment_info["preview_url"] = (
+            candidate.get("preview_url") or candidate.get("source_url") or ""
+        )
         segment_info["provider"] = candidate.get("provider", "pexels")
         segment_info["trim_start"] = round(trim_start, 3)
         segment_info["trim_end"] = (
@@ -757,6 +894,7 @@ def _render_selection_impl(task_id, selections):
             else round(candidate_duration, 3)
         )
         selected_segments.append(segment_info)
+        selected_material_paths.append(local_material_path)
 
     sm.state.update_task(
         task_id,
@@ -858,6 +996,12 @@ def _render_selection_impl(task_id, selections):
     )
     if not final_video_paths:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        _cleanup_final_only_artifacts(
+            task_id,
+            material_paths=selected_material_paths,
+            combined_video_paths=combined_video_paths,
+            extra_paths=[edited_audio_dir],
+        )
         return
 
     script_file_extra = {
@@ -865,7 +1009,7 @@ def _render_selection_impl(task_id, selections):
         "audio_duration": audio_duration,
         "subtitle_path": edited_subtitle_path,
         "requires_selection": False,
-        "selected_segments": edited_segments,
+        "selected_segments": _strip_task_local_materials(task_id, edited_segments),
         "audio_tail_pause": tail_pause,
     }
     save_script_data(
@@ -873,22 +1017,29 @@ def _render_selection_impl(task_id, selections):
         script_data.get("script", ""),
         script_data.get("search_terms", []),
         params,
-        matched_segments=edited_segments,
+        matched_segments=_strip_task_local_materials(task_id, edited_segments),
         extra=script_file_extra,
     )
+    metadata_segments = _strip_task_local_materials(task_id, edited_segments)
 
     kwargs = {
         "videos": final_video_paths,
-        "combined_videos": combined_video_paths,
+        "combined_videos": [],
         "script": script_data.get("script", ""),
         "terms": script_data.get("search_terms", []),
         "audio_file": edited_audio_file,
         "audio_duration": audio_duration,
         "subtitle_path": edited_subtitle_path,
-        "materials": downloaded_videos,
-        "matched_segments": edited_segments,
+        "materials": [],
+        "matched_segments": metadata_segments,
         "requires_selection": False,
     }
+    _cleanup_final_only_artifacts(
+        task_id,
+        material_paths=selected_material_paths,
+        combined_video_paths=combined_video_paths,
+        extra_paths=[edited_audio_dir],
+    )
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )
@@ -1077,6 +1228,11 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
 
     if not final_video_paths:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        _cleanup_final_only_artifacts(
+            task_id,
+            material_paths=downloaded_videos,
+            combined_video_paths=combined_video_paths,
+        )
         return
 
     logger.success(
@@ -1100,17 +1256,30 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
 
     kwargs = {
         "videos": final_video_paths,
-        "combined_videos": combined_video_paths,
+        "combined_videos": [],
         "script": video_script,
         "terms": video_terms,
         "audio_file": audio_file,
         "audio_duration": audio_duration,
         "subtitle_path": subtitle_path,
-        "materials": downloaded_videos,
+        "materials": [],
         "cross_post_results": cross_post_results if cross_post_results else None,
     }
     if matched_segments:
-        kwargs["matched_segments"] = matched_segments
+        metadata_segments = _strip_task_local_materials(task_id, matched_segments)
+        kwargs["matched_segments"] = metadata_segments
+        save_script_data(
+            task_id,
+            video_script,
+            video_terms,
+            params,
+            matched_segments=metadata_segments,
+        )
+    _cleanup_final_only_artifacts(
+        task_id,
+        material_paths=downloaded_videos,
+        combined_video_paths=combined_video_paths,
+    )
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )

@@ -314,6 +314,82 @@ class TestTaskService(unittest.TestCase):
                 )
         finally:
             shutil.rmtree(task_dir, ignore_errors=True)
+
+    def test_materialize_remote_candidate_downloads_selected_source_once(self):
+        task_id = "render-selection-downloads-selected"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task_root = os.path.join(temp_dir, task_id)
+
+            def fake_task_dir(sub_dir=""):
+                target = os.path.join(temp_dir, sub_dir) if sub_dir else temp_dir
+                os.makedirs(target, exist_ok=True)
+                return target
+
+            def fake_save_video(video_url, save_dir=""):
+                os.makedirs(save_dir, exist_ok=True)
+                saved_path = os.path.join(save_dir, "selected.mp4")
+                Path(saved_path).write_bytes(b"fake-video")
+                return saved_path
+
+            candidate = {
+                "candidate_id": "seg-1-cand-1",
+                "source_url": "https://v.example/selected.mp4",
+                "preview_url": "https://v.example/selected.mp4",
+                "material": "",
+            }
+            url_to_path = {}
+
+            with (
+                patch.object(tm.utils, "task_dir", side_effect=fake_task_dir),
+                patch.object(tm.material, "save_video", side_effect=fake_save_video) as save_video,
+            ):
+                first_path = tm._materialize_remote_candidate(candidate, task_id, url_to_path)
+                second_path = tm._materialize_remote_candidate(candidate, task_id, url_to_path)
+
+            self.assertTrue(first_path.startswith(task_root))
+            self.assertEqual(first_path, second_path)
+            save_video.assert_called_once_with(
+                video_url="https://v.example/selected.mp4",
+                save_dir=os.path.join(task_root, "selected_materials"),
+            )
+
+    def test_cleanup_final_only_artifacts_removes_temp_inputs_and_combined_video(self):
+        task_id = "cleanup-final-only"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task_root = os.path.join(temp_dir, task_id)
+            render_dir = os.path.join(task_root, "render_materials")
+            selected_dir = os.path.join(task_root, "selected_materials")
+            os.makedirs(render_dir, exist_ok=True)
+            os.makedirs(selected_dir, exist_ok=True)
+
+            material_path = os.path.join(selected_dir, "source.mp4")
+            combined_path = os.path.join(task_root, "combined-1.mp4")
+            final_path = os.path.join(task_root, "final-1.mp4")
+            extra_dir = os.path.join(task_root, "edited_audio_segments")
+            os.makedirs(extra_dir, exist_ok=True)
+            for file_path in (material_path, combined_path, final_path):
+                Path(file_path).write_bytes(b"x")
+            Path(os.path.join(extra_dir, "segment-001.mp3")).write_bytes(b"x")
+
+            def fake_task_dir(sub_dir=""):
+                target = os.path.join(temp_dir, sub_dir) if sub_dir else temp_dir
+                os.makedirs(target, exist_ok=True)
+                return target
+
+            with patch.object(tm.utils, "task_dir", side_effect=fake_task_dir):
+                tm._cleanup_final_only_artifacts(
+                    task_id,
+                    material_paths=[material_path, "https://v.example/source.mp4"],
+                    combined_video_paths=[combined_path],
+                    extra_paths=[extra_dir],
+                )
+
+            self.assertTrue(os.path.exists(final_path))
+            self.assertFalse(os.path.exists(material_path))
+            self.assertFalse(os.path.exists(combined_path))
+            self.assertFalse(os.path.exists(render_dir))
+            self.assertFalse(os.path.exists(selected_dir))
+            self.assertFalse(os.path.exists(extra_dir))
     
     def test_task_local_materials(self):
         task_id = "00000000-0000-0000-0000-000000000000"

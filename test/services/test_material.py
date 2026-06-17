@@ -228,9 +228,9 @@ class TestMaterialTlsVerification(unittest.TestCase):
         self.assertEqual(matched_segments[1]["material"], "/tmp/middle.mp4")
         self.assertEqual(matched_segments[2]["material"], "/tmp/middle.mp4")
 
-    def test_download_candidate_videos_for_segments_keeps_three_candidates_per_sentence(self):
+    def test_download_candidate_videos_for_segments_keeps_three_remote_candidates_per_sentence(self):
         """
-        编辑器候选准备阶段要为每句最多下载 3 条本地候选，优先避免重复 URL；
+        编辑器候选准备阶段要为每句最多返回 3 条远程候选，优先避免重复 URL；
         如果后续句子完全搜不到，则复用上一句候选并标记 fallback。
         """
         shared = "https://v.example/shared.mp4"
@@ -247,20 +247,8 @@ class TestMaterialTlsVerification(unittest.TestCase):
             ],
             "missing": [],
         }
-        downloaded_urls = []
-
-        def fake_task_dir(sub_dir=""):
-            root = os.path.join(temp_dir, "tasks")
-            target = os.path.join(root, sub_dir) if sub_dir else root
-            os.makedirs(target, exist_ok=True)
-            return target
-
         def fake_search(search_term, minimum_duration, video_aspect):
             return search_results[search_term]
-
-        def fake_save_video(video_url, save_dir=""):
-            downloaded_urls.append(video_url)
-            return os.path.join(save_dir, video_url.rsplit("/", 1)[-1])
 
         segments = [
             {"index": 1, "term": "opening", "duration": 3, "material": ""},
@@ -268,37 +256,29 @@ class TestMaterialTlsVerification(unittest.TestCase):
             {"index": 3, "term": "missing", "duration": 3, "material": ""},
         ]
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with (
-                patch.object(material.utils, "task_dir", side_effect=fake_task_dir),
-                patch.object(material, "search_videos_pexels", side_effect=fake_search),
-                patch.object(material, "save_video", side_effect=fake_save_video),
-            ):
-                paths, matched_segments = material.download_candidate_videos_for_segments(
-                    task_id="candidate-task",
-                    segments=segments,
-                    source="pexels",
-                    max_clip_duration=3,
-                )
+        with (
+            patch.object(material, "search_videos_pexels", side_effect=fake_search),
+            patch.object(material, "save_video") as save_video,
+        ):
+            paths, matched_segments = material.download_candidate_videos_for_segments(
+                task_id="candidate-task",
+                segments=segments,
+                source="pexels",
+                max_clip_duration=3,
+            )
 
-        self.assertEqual(len(paths), 6)
+        self.assertEqual(paths, [])
+        save_video.assert_not_called()
         self.assertEqual(len(matched_segments[0]["candidates"]), 3)
         self.assertEqual(len(matched_segments[1]["candidates"]), 3)
         self.assertEqual(len(matched_segments[2]["candidates"]), 3)
         self.assertEqual(matched_segments[0]["candidates"][0]["candidate_id"], "seg-1-cand-1")
         self.assertEqual(matched_segments[1]["candidates"][0]["source_url"], "https://v.example/b2.mp4")
+        self.assertEqual(matched_segments[1]["candidates"][0]["preview_url"], "https://v.example/b2.mp4")
+        self.assertEqual(matched_segments[0]["candidates"][0]["material"], "")
+        self.assertEqual(matched_segments[0]["material"], "")
+        self.assertEqual(matched_segments[0]["preview_url"], shared)
         self.assertTrue(all(candidate["fallback"] for candidate in matched_segments[2]["candidates"]))
-        self.assertEqual(
-            downloaded_urls,
-            [
-                shared,
-                "https://v.example/a2.mp4",
-                "https://v.example/a3.mp4",
-                "https://v.example/b2.mp4",
-                "https://v.example/b3.mp4",
-                shared,
-            ],
-        )
 
 
 class TestCoverrProvider(unittest.TestCase):
