@@ -1,6 +1,9 @@
 import os
 import sys
 import webbrowser
+import html
+import csv
+import io
 from uuid import UUID, uuid4
 
 import requests
@@ -23,7 +26,7 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
-from app.services import llm, voice
+from app.services import llm, preproduction, voice
 from app.services import state as sm
 from app.services import task as tm
 from app.utils import utils
@@ -59,13 +62,83 @@ i18n_dir = os.path.join(root_dir, "webui", "i18n")
 config_file = os.path.join(root_dir, "webui", ".streamlit", "webui.toml")
 system_locale = utils.get_system_locale()
 
+DEFAULT_TEST_VIDEO_SUBJECT = "中国五大城市硬核盘点"
+DEFAULT_TEST_VIDEO_SCRIPT = """第五 广州 常住人口约1898万人。
+面积约7434平方公里。
+2024年GDP约3.10万亿元。
+千年商都广州把烟火气炼成硬实力。
+
+第四 重庆 常住人口约3190万人。
+面积约8.24万平方公里。
+2024年GDP约3.21万亿元。
+山城重庆把江河桥梁和万家灯火写成中国速度。
+
+第三 深圳 常住人口约1779万人。
+面积约1997平方公里。
+2024年GDP约3.68万亿元。
+年轻的深圳用科技资本和效率把奇迹变成日常。
+
+第二 北京 常住人口约2186万人。
+面积约1.64万平方公里。
+2024年GDP约4.98万亿元。
+首都北京把历史权力和创新压成一座世界级引擎。
+
+第一 上海 常住人口约2487万人。
+面积约6340平方公里。
+2024年GDP约5.39万亿元。
+东方之巅上海用金融航运和天际线定义中国高度。"""
+DEFAULT_TEST_VIDEO_TERMS = (
+    "广州城市天际线，广州城市航拍，广州CBD天际线，广州小蛮腰夜景，"
+    "重庆城市天际线，重庆山城航拍，重庆长江大桥，重庆城市夜景，"
+    "深圳城市天际线，深圳城市航拍，深圳科技城市，深圳福田天际线，"
+    "北京城市天际线，北京城市航拍，北京CBD天际线，北京天安门城市，"
+    "上海城市天际线，上海城市航拍，上海陆家嘴天际线，上海黄浦江天际线"
+)
+SIMPLE_CANDIDATE_PROVIDER_OPTIONS = ("pexels", "x")
+SIMPLE_CANDIDATE_PROVIDER_LABELS = {
+    "pexels": "Pexels",
+    "x": "X",
+}
+STOCK_CANDIDATE_PROVIDERS = {"pexels", "pixabay", "coverr"}
+
+
+def _default_preproduction_csv() -> str:
+    script_lines = utils.split_script_to_visual_lines(DEFAULT_TEST_VIDEO_SCRIPT)
+    display_terms = [
+        term.strip()
+        for term in DEFAULT_TEST_VIDEO_TERMS.split("，")
+        if term.strip()
+    ]
+    rows = []
+    for index, script_line in enumerate(script_lines, start=1):
+        keyword = display_terms[index - 1] if index - 1 < len(display_terms) else ""
+        rows.append(
+            {
+                "segment_index": index,
+                "title": DEFAULT_TEST_VIDEO_SUBJECT,
+                "script": script_line,
+                "keyword_cn": keyword,
+                "material_query": tm._translate_cjk_stock_search_term(keyword),
+                "providers": "pexels",
+                "source_urls": "",
+                "duration_sec": "",
+                "preferred_orientation": "",
+                "notes": "",
+            }
+        )
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=preproduction.DEFAULT_COLUMNS)
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue()
+
 
 if "video_subject" not in st.session_state:
-    st.session_state["video_subject"] = ""
+    st.session_state["video_subject"] = DEFAULT_TEST_VIDEO_SUBJECT
 if "video_script" not in st.session_state:
-    st.session_state["video_script"] = ""
+    st.session_state["video_script"] = DEFAULT_TEST_VIDEO_SCRIPT
 if "video_terms" not in st.session_state:
-    st.session_state["video_terms"] = ""
+    st.session_state["video_terms"] = DEFAULT_TEST_VIDEO_TERMS
 if "video_script_prompt" not in st.session_state:
     st.session_state["video_script_prompt"] = ""
 if "custom_system_prompt" not in st.session_state:
@@ -81,6 +154,19 @@ if "ui_language" not in st.session_state:
 if "local_video_materials" not in st.session_state:
     # 记住用户最近一次已经落盘的本地素材，避免仅修改文案后二次生成时丢失素材列表。
     st.session_state["local_video_materials"] = []
+if "preproduction_csv_text" not in st.session_state:
+    st.session_state["preproduction_csv_text"] = _default_preproduction_csv()
+if "preproduction_rows" not in st.session_state:
+    st.session_state["preproduction_rows"] = []
+if "simple_candidate_providers" not in st.session_state:
+    configured_providers = preproduction.normalize_provider_list(
+        config.app.get("candidate_preview_providers", ["pexels"])
+    )
+    st.session_state["simple_candidate_providers"] = [
+        provider
+        for provider in configured_providers
+        if provider in SIMPLE_CANDIDATE_PROVIDER_OPTIONS
+    ] or ["pexels"]
 
 # 加载语言文件
 locales = utils.load_locales(i18n_dir)
@@ -263,11 +349,235 @@ def _as_list_config_value(key: str) -> list:
     return []
 
 
+def _voice_rate_from_percent(percent: int | float) -> float:
+    try:
+        numeric_percent = float(percent)
+    except (TypeError, ValueError):
+        numeric_percent = 0.0
+    numeric_percent = min(max(numeric_percent, -50.0), 50.0)
+    return round(1.0 + numeric_percent / 100.0, 2)
+
+
+def _voice_rate_percent_from_rate(rate: int | float | str) -> int:
+    try:
+        numeric_rate = float(rate)
+    except (TypeError, ValueError):
+        numeric_rate = 1.0
+    numeric_rate = min(max(numeric_rate, 0.5), 1.5)
+    return int(round((numeric_rate - 1.0) * 100))
+
+
+def _simple_voice_rate_value() -> float:
+    if "simple_voice_rate_percent" in st.session_state:
+        return _voice_rate_from_percent(st.session_state["simple_voice_rate_percent"])
+    return _voice_rate_from_percent(
+        _voice_rate_percent_from_rate(st.session_state.get("simple_voice_rate", 1.0))
+    )
+
+
+def _format_voice_rate_percent(percent: int | float) -> str:
+    try:
+        numeric_percent = int(round(float(percent)))
+    except (TypeError, ValueError):
+        numeric_percent = 0
+    return f"{numeric_percent:+d}%"
+
+
+def _render_voice_rate_control():
+    if "simple_voice_rate_percent" not in st.session_state:
+        st.session_state["simple_voice_rate_percent"] = _voice_rate_percent_from_rate(
+            st.session_state.get("simple_voice_rate", 1.0)
+        )
+
+    voice_rate_percent = st.slider(
+        "配音语速",
+        min_value=-50,
+        max_value=50,
+        step=5,
+        format="%d%%",
+        key="simple_voice_rate_percent",
+        help="负数会放慢配音，正数会加快配音。每句 clip 时长会跟随配音重新计算，但视频素材不会变速。",
+    )
+    voice_rate = _voice_rate_from_percent(voice_rate_percent)
+    st.session_state["simple_voice_rate"] = voice_rate
+    st.caption(
+        f"当前语速：{_format_voice_rate_percent(voice_rate_percent)} "
+        f"({voice_rate:.2f}x)。候选时长和最终字幕会按配音重算，视频素材不变速。"
+    )
+
+
+def _preproduction_editor_rows(rows: list[dict]) -> list[dict]:
+    editor_rows = []
+    for row in preproduction.normalize_preproduction_rows(rows):
+        editor_rows.append(
+            {
+                "segment_index": row["segment_index"],
+                "script": row["script"],
+                "keyword_cn": row["keyword_cn"],
+                "material_query": row["material_query"],
+                "providers": ", ".join(row["providers"]),
+                "source_urls": "\n".join(row["source_urls"]),
+                "duration_sec": row["duration_sec"] or "",
+                "preferred_orientation": row["preferred_orientation"],
+                "notes": row["notes"],
+            }
+        )
+    return editor_rows
+
+
+def _preproduction_rows_from_editor(rows) -> list[dict]:
+    normalized = []
+    if hasattr(rows, "to_dict"):
+        rows = rows.to_dict("records")
+    if not isinstance(rows, list):
+        return normalized
+    for row in rows:
+        row = dict(row)
+        row["providers"] = preproduction.normalize_provider_list(row.get("providers"))
+        row["source_urls"] = preproduction.normalize_source_urls(row.get("source_urls"))
+        normalized.append(row)
+    return preproduction.normalize_preproduction_rows(normalized)
+
+
+def _sync_preproduction_rows_to_inputs(rows: list[dict]):
+    rows = preproduction.normalize_preproduction_rows(rows)
+    if not rows:
+        return
+    plan = preproduction.build_preproduction_plan(
+        rows,
+        title=st.session_state.get("video_subject", ""),
+    )
+    if plan.get("title"):
+        st.session_state["video_subject"] = plan["title"]
+    st.session_state["video_script"] = plan.get("script", "")
+    st.session_state["video_terms"] = "，".join(plan.get("display_terms") or [])
+    st.session_state["script_keyword_matches"] = [
+        {
+            "index": row["segment_index"],
+            "text": row["script"],
+            "term": row["keyword_cn"],
+            "score": "",
+            "reason": "CSV 预生产计划",
+        }
+        for row in rows
+    ]
+    st.session_state.pop("script_keyword_match_signature", None)
+
+
+def _preproduction_plan_from_session() -> dict | None:
+    rows = preproduction.normalize_preproduction_rows(
+        st.session_state.get("preproduction_rows") or []
+    )
+    if not rows:
+        return None
+    return preproduction.build_preproduction_plan(
+        rows,
+        title=st.session_state.get("video_subject", ""),
+    )
+
+
+def _candidate_provider_label(provider: str) -> str:
+    provider_name = str(provider or "").strip().lower()
+    return SIMPLE_CANDIDATE_PROVIDER_LABELS.get(provider_name, provider_name.upper())
+
+
+def _selected_simple_candidate_providers() -> list[str]:
+    providers = preproduction.normalize_provider_list(
+        st.session_state.get("simple_candidate_providers") or ["pexels"]
+    )
+    providers = [
+        provider
+        for provider in providers
+        if provider in SIMPLE_CANDIDATE_PROVIDER_OPTIONS
+    ]
+    return providers or ["pexels"]
+
+
+def _simple_material_query_for_keyword(keyword: str, providers: list[str]) -> str:
+    keyword = str(keyword or "").strip()
+    if any(provider in STOCK_CANDIDATE_PROVIDERS for provider in providers):
+        return tm._translate_cjk_stock_search_term(keyword)
+    return keyword
+
+
+def _implicit_preproduction_plan_from_keyword_matches() -> dict | None:
+    explicit_plan = _preproduction_plan_from_session()
+    if explicit_plan:
+        return explicit_plan
+
+    providers = _selected_simple_candidate_providers()
+    if providers == ["pexels"]:
+        return None
+
+    script = st.session_state.get("video_script", "").strip()
+    script_lines = utils.split_script_to_visual_lines(script)
+    if not script_lines:
+        return None
+
+    rows = _normalize_keyword_match_rows(
+        st.session_state.get("script_keyword_matches") or []
+    )
+    if len(rows) != len(script_lines):
+        rows = tm.build_script_keyword_matches(
+            video_script=script,
+            video_terms=st.session_state.get("video_terms", ""),
+            video_subject=st.session_state.get("video_subject", ""),
+        )
+
+    rows = _normalize_keyword_match_rows(rows)
+    if len(rows) != len(script_lines):
+        return None
+
+    plan_rows = []
+    for index, script_line in enumerate(script_lines, start=1):
+        match_row = rows[index - 1]
+        keyword = str(match_row.get("term") or script_line).strip()
+        plan_rows.append(
+            {
+                "segment_index": index,
+                "title": st.session_state.get("video_subject", ""),
+                "script": script_line,
+                "keyword_cn": keyword,
+                "material_query": _simple_material_query_for_keyword(
+                    keyword, providers
+                ),
+                "providers": providers,
+                "source_urls": [],
+                "duration_sec": 0.0,
+                "preferred_orientation": "",
+                "notes": "普通流程素材库选择",
+            }
+        )
+
+    return preproduction.build_preproduction_plan(
+        plan_rows,
+        title=st.session_state.get("video_subject", ""),
+    )
+
+
+def _providers_required_for_prepare() -> set[str]:
+    plan = _preproduction_plan_from_session()
+    if not plan:
+        return set(_selected_simple_candidate_providers()) or {"pexels"}
+    providers = set()
+    for row in plan.get("segments") or []:
+        providers.update(preproduction.normalize_provider_list(row.get("providers")))
+        if preproduction.normalize_source_urls(row.get("source_urls")):
+            providers.add("url")
+    return providers or {"pexels"}
+
+
 def _build_editor_params() -> VideoParams:
+    matched_terms = _matched_terms_from_session()
+    preproduction_plan = _implicit_preproduction_plan_from_keyword_matches()
+    if preproduction_plan:
+        video_terms = preproduction_plan.get("display_terms") or matched_terms
+    else:
+        video_terms = matched_terms or st.session_state.get("video_terms", "").strip()
     params = VideoParams(
         video_subject=st.session_state.get("video_subject", "").strip(),
         video_script=st.session_state.get("video_script", "").strip(),
-        video_terms=st.session_state.get("video_terms", "").strip(),
+        video_terms=video_terms,
         video_source="pexels",
         video_aspect=st.session_state.get(
             "simple_video_aspect", VideoAspect.portrait.value
@@ -281,7 +591,7 @@ def _build_editor_params() -> VideoParams:
             "simple_voice_name",
             config.ui.get("voice_name", "en-AU-NatashaNeural-Female"),
         ),
-        voice_rate=float(st.session_state.get("simple_voice_rate", 1.0)),
+        voice_rate=_simple_voice_rate_value(),
         voice_volume=1.0,
         bgm_type="",
         bgm_file="",
@@ -303,8 +613,98 @@ def _build_editor_params() -> VideoParams:
         paragraph_number=1,
         video_script_prompt=st.session_state.get("video_script_prompt", ""),
         custom_system_prompt=st.session_state.get("custom_system_prompt", ""),
+        preproduction_plan=preproduction_plan,
     )
     return params
+
+
+def _keyword_match_signature(script: str, terms: str, subject: str) -> str:
+    return utils.md5(f"{subject}\n---script---\n{script}\n---terms---\n{terms}")
+
+
+def _normalize_keyword_match_rows(rows) -> list[dict]:
+    normalized_rows = []
+    if not isinstance(rows, list):
+        return normalized_rows
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        index = int(row.get("index") or len(normalized_rows) + 1)
+        text = str(row.get("text") or "").strip()
+        term = str(row.get("term") or row.get("keyword") or "").strip()
+        normalized_rows.append(
+            {
+                "index": index,
+                "text": text,
+                "term": term,
+                "score": row.get("score", ""),
+                "reason": str(row.get("reason") or ""),
+            }
+        )
+    return normalized_rows
+
+
+def _matched_terms_from_session() -> list[str]:
+    rows = _normalize_keyword_match_rows(
+        st.session_state.get("script_keyword_matches") or []
+    )
+    script_lines = utils.split_script_to_visual_lines(
+        st.session_state.get("video_script", "")
+    )
+    if not rows or len(rows) != len(script_lines):
+        return []
+    terms = [row["term"] for row in rows if row.get("term")]
+    return terms if len(terms) == len(script_lines) else []
+
+
+def _render_script_keyword_match_editor(force_refresh: bool = False):
+    script = st.session_state.get("video_script", "").strip()
+    if not script:
+        return
+
+    script_lines = utils.split_script_to_visual_lines(script)
+    if not script_lines:
+        return
+
+    terms_text = st.session_state.get("video_terms", "").strip()
+    subject = st.session_state.get("video_subject", "").strip()
+    signature = _keyword_match_signature(script, terms_text, subject)
+    if force_refresh or st.session_state.get("script_keyword_match_signature") != signature:
+        st.session_state["script_keyword_matches"] = tm.build_script_keyword_matches(
+            video_script=script,
+            video_terms=terms_text,
+            video_subject=subject,
+        )
+        st.session_state["script_keyword_match_signature"] = signature
+
+    rows = _normalize_keyword_match_rows(
+        st.session_state.get("script_keyword_matches") or []
+    )
+    st.subheader("脚本关键词匹配")
+    st.caption("先确认每句脚本对应的搜索关键词；这里改完后，再准备候选素材。")
+    edited_rows = st.data_editor(
+        rows,
+        hide_index=True,
+        width="stretch",
+        num_rows="fixed",
+        column_order=("index", "text", "term", "reason"),
+        disabled=("index", "text", "reason"),
+        key=f"keyword_match_editor_{signature}",
+        column_config={
+            "index": st.column_config.NumberColumn("句", width="small"),
+            "text": st.column_config.TextColumn("脚本句子", width="large"),
+            "term": st.column_config.TextColumn("匹配关键词", width="medium"),
+            "reason": st.column_config.TextColumn("匹配方式", width="medium"),
+        },
+    )
+    st.session_state["script_keyword_matches"] = _normalize_keyword_match_rows(
+        edited_rows
+    )
+    matched_terms = _matched_terms_from_session()
+    if matched_terms:
+        st.caption(f"将按 {len(matched_terms)} 个逐句关键词搜索候选素材。")
+    else:
+        st.warning("请为每一句脚本填写一个关键词，之后再准备候选素材。")
 
 
 def _show_video_preview(video_path: str, caption: str = ""):
@@ -337,7 +737,12 @@ def _build_progress_updater(initial_message: str):
 
 
 def _candidate_preview_caption(candidate: dict) -> str:
-    parts = [f"候选 {candidate.get('rank')}"]
+    orientation_label = candidate.get("orientation_label") or ""
+    group_rank = candidate.get("group_rank") or candidate.get("rank")
+    provider = _candidate_provider_label(candidate.get("provider") or "")
+    parts = [f"{orientation_label}候选 {group_rank}".strip()]
+    if provider:
+        parts.append(provider)
     score = candidate.get("score")
     if score is not None:
         try:
@@ -350,7 +755,222 @@ def _candidate_preview_caption(candidate: dict) -> str:
         parts.append(f"{width}x{height}")
     if candidate.get("fallback"):
         parts.append("fallback")
+    attribution = candidate.get("attribution") or candidate.get("author") or ""
+    if attribution:
+        parts.append(str(attribution))
     return " · ".join(parts)
+
+
+def _render_candidate_preview_grid(candidates: list[dict]):
+    if not candidates:
+        return
+    for start in range(0, len(candidates), 3):
+        row_candidates = candidates[start:start + 3]
+        preview_cols = st.columns(min(3, len(row_candidates)))
+        for preview_col, candidate in zip(preview_cols, row_candidates):
+            with preview_col:
+                _show_video_preview(
+                    candidate.get("preview_url")
+                    or candidate.get("source_url")
+                    or candidate.get("material", ""),
+                    caption=_candidate_preview_caption(candidate),
+                )
+                if candidate.get("reason"):
+                    st.caption(candidate["reason"])
+
+
+def _render_candidate_preview_group(candidates: list[dict]):
+    if not candidates:
+        return
+    provider_order = []
+    for candidate in candidates:
+        provider = str(candidate.get("provider") or "pexels").strip().lower()
+        if provider and provider not in provider_order:
+            provider_order.append(provider)
+
+    if len(provider_order) <= 1:
+        _render_candidate_preview_grid(candidates)
+        return
+
+    tabs = st.tabs(
+        [
+            f"{_candidate_provider_label(provider)} ({sum(1 for item in candidates if str(item.get('provider') or 'pexels').strip().lower() == provider)})"
+            for provider in provider_order
+        ]
+    )
+    for tab, provider in zip(tabs, provider_order):
+        with tab:
+            _render_candidate_preview_grid(
+                [
+                    candidate
+                    for candidate in candidates
+                    if str(candidate.get("provider") or "pexels").strip().lower()
+                    == provider
+                ]
+            )
+
+
+def _truncate_clip_text(text: str, max_chars: int = 36) -> str:
+    normalized = str(text or "").replace("\n", " ").strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[:max_chars].rstrip()}..."
+
+
+def _segment_display_term(
+    segment: dict, display_terms: list[str], segment_index: int
+) -> str:
+    term = (
+        segment.get("display_term")
+        or (
+            display_terms[segment_index - 1]
+            if 0 <= segment_index - 1 < len(display_terms)
+            else ""
+        )
+        or segment.get("term")
+        or ""
+    )
+    return str(term).strip()
+
+
+def _selected_candidate_for_segment(
+    candidates: list[dict], selected_candidate_id: str
+) -> dict:
+    return next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.get("candidate_id") == selected_candidate_id
+        ),
+        candidates[0] if candidates else {},
+    )
+
+
+def _timeline_thumbnail_url(segment: dict, selected_candidate: dict) -> str:
+    candidates = segment.get("candidates") or []
+    first_candidate = candidates[0] if candidates else {}
+    return str(
+        selected_candidate.get("thumbnail_url")
+        or first_candidate.get("thumbnail_url")
+        or segment.get("thumbnail_url")
+        or ""
+    ).strip()
+
+
+def _render_timeline_thumbnail(thumbnail_url: str, fallback_text: str):
+    safe_text = html.escape(_truncate_clip_text(fallback_text or "无缩略图", 16))
+    if thumbnail_url:
+        safe_url = html.escape(thumbnail_url, quote=True)
+        st.markdown(
+            f"""
+            <div class="candidate-timeline-thumb">
+                <img src="{safe_url}" alt="clip thumbnail" />
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.markdown(
+        f"""
+        <div class="candidate-timeline-thumb candidate-timeline-placeholder">
+            <span>{safe_text}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_candidate_timeline_styles():
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stHorizontalBlock"]:has(.candidate-timeline-card) {
+            overflow-x: auto;
+            flex-wrap: nowrap;
+            padding: 0.2rem 0 0.6rem;
+            scrollbar-width: thin;
+        }
+        div[data-testid="stHorizontalBlock"]:has(.candidate-timeline-card) > div {
+            flex: 0 0 220px !important;
+            width: 220px !important;
+        }
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(.candidate-timeline-active) {
+            border-color: #ff4b4b !important;
+            box-shadow: 0 0 0 1px rgba(255, 75, 75, 0.35);
+        }
+        .candidate-timeline-thumb {
+            width: 100%;
+            height: 112px;
+            border-radius: 6px;
+            overflow: hidden;
+            background: #20242d;
+            border: 1px solid rgba(250, 250, 250, 0.12);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 0.4rem;
+        }
+        .candidate-timeline-thumb img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+        .candidate-timeline-placeholder {
+            color: rgba(250, 250, 250, 0.72);
+            font-size: 0.82rem;
+            line-height: 1.25;
+            text-align: center;
+            padding: 0.45rem;
+        }
+        .candidate-timeline-meta {
+            color: rgba(250, 250, 250, 0.72);
+            font-size: 0.78rem;
+            line-height: 1.25;
+            margin: 0.1rem 0;
+        }
+        .candidate-timeline-term,
+        .candidate-timeline-script {
+            color: rgba(250, 250, 250, 0.78);
+            font-size: 0.86rem;
+            font-weight: 600;
+            line-height: 1.35;
+            overflow: hidden;
+            display: -webkit-box;
+            -webkit-box-orient: vertical;
+            word-break: break-word;
+        }
+        .candidate-timeline-term {
+            height: 2.35rem;
+            -webkit-line-clamp: 2;
+            margin: 0.25rem 0 0.45rem;
+        }
+        .candidate-timeline-script {
+            height: 3.55rem;
+            -webkit-line-clamp: 3;
+            margin-bottom: 0.75rem;
+        }
+        .candidate-timeline-label {
+            color: rgba(250, 250, 250, 0.58);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_candidate_timeline_text(label: str, value: str, css_class: str):
+    safe_label = html.escape(label)
+    safe_value = html.escape(str(value or ""))
+    st.markdown(
+        f"""
+        <div class="{css_class}">
+            <span class="candidate-timeline-label">{safe_label}</span>{safe_value}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _load_candidate_task(task_id: str):
@@ -364,134 +984,460 @@ def _render_candidate_editor(task_data: dict):
     if not matched_segments:
         st.info("还没有候选素材。先点击“准备候选素材”。")
         return
+    display_terms = tm._normalize_video_terms(
+        (task_data.get("params") or {}).get("video_terms")
+    )
+    if isinstance(display_terms, str):
+        display_terms = []
 
     st.subheader("逐句候选素材")
-    st.caption("每一句字幕对应一个关键词和最多三条 Pexels 候选视频。候选素材直接使用在线链接预览，渲染时只临时下载你选中的视频。")
-    selections = []
+    st.caption("所有 clips 按时间轴横向排列；点击任意片段后，在下方预览、选择候选视频并调整裁剪。")
+    _render_candidate_timeline_styles()
 
-    for segment in matched_segments:
-        segment_index = int(segment.get("index") or len(selections) + 1)
+    editor_task_id = str(
+        task_data.get("task_id") or st.session_state.get("candidate_task_id") or ""
+    )
+    if st.session_state.get("candidate_edit_task_id") != editor_task_id:
+        st.session_state["candidate_edit_task_id"] = editor_task_id
+        st.session_state["candidate_edit_state"] = {}
+    edit_state = st.session_state.setdefault("candidate_edit_state", {})
+
+    segment_by_index = {
+        int(segment.get("index") or index + 1): segment
+        for index, segment in enumerate(matched_segments)
+    }
+    segment_states = {}
+
+    for index, segment in enumerate(matched_segments):
+        segment_index = int(segment.get("index") or index + 1)
         candidates = segment.get("candidates") or []
-        with st.container(border=True):
-            st.markdown(
-                f"**{segment_index}. {segment.get('text', '')}**  \n"
-                f"关键词：`{segment.get('term', '')}` · 当前时长："
-                f"{float(segment.get('duration') or 0):.2f}s"
-            )
-            if not candidates:
-                st.error("这一句没有可用候选素材。")
-                continue
+        if not candidates:
+            continue
 
-            preview_cols = st.columns(min(3, len(candidates)))
-            for preview_col, candidate in zip(preview_cols, candidates):
-                with preview_col:
-                    _show_video_preview(
-                        candidate.get("preview_url")
-                        or candidate.get("source_url")
-                        or candidate.get("material", ""),
-                        caption=_candidate_preview_caption(candidate),
+        candidate_ids = [
+            candidate.get("candidate_id", "") for candidate in candidates
+            if candidate.get("candidate_id")
+        ]
+        if not candidate_ids:
+            continue
+
+        default_candidate_id = candidate_ids[0]
+        choice_key = f"candidate_choice_{segment_index}"
+        choice_widget_key = f"candidate_choice_widget_{segment_index}"
+        segment_edit = edit_state.setdefault(str(segment_index), {})
+        if st.session_state.get(choice_widget_key) in candidate_ids:
+            segment_edit["candidate_id"] = st.session_state[choice_widget_key]
+        elif st.session_state.get(choice_key) in candidate_ids:
+            segment_edit["candidate_id"] = st.session_state[choice_key]
+        elif segment_edit.get("candidate_id") in candidate_ids:
+            pass
+        else:
+            segment_edit["candidate_id"] = default_candidate_id
+        st.session_state[choice_key] = segment_edit["candidate_id"]
+
+        selected_candidate_id = (
+            segment_edit.get("candidate_id")
+            or st.session_state.get(choice_key)
+            or default_candidate_id
+        )
+        selected_candidate = _selected_candidate_for_segment(
+            candidates, selected_candidate_id
+        )
+        candidate_duration = float(selected_candidate.get("duration") or 0.0)
+        trim_start_key = f"trim_start_{segment_index}"
+        trim_end_key = f"trim_end_{segment_index}"
+        text_key = f"segment_text_{segment_index}"
+        max_trim_start = (
+            max(candidate_duration - 0.1, 0.0)
+            if candidate_duration > 0.1
+            else None
+        )
+        if trim_start_key in st.session_state:
+            segment_edit["trim_start"] = st.session_state[trim_start_key]
+        if trim_end_key in st.session_state:
+            segment_edit["trim_end"] = st.session_state[trim_end_key]
+        if text_key in st.session_state:
+            segment_edit["text"] = st.session_state[text_key]
+
+        current_trim_start = max(
+            float(segment_edit.get("trim_start", 0.0) or 0.0), 0.0
+        )
+        if max_trim_start is not None:
+            current_trim_start = min(current_trim_start, max_trim_start)
+        current_trim_end = float(
+            segment_edit.get(
+                "trim_end",
+                candidate_duration
+                or max(float(segment.get("duration") or 1.0), 1.0),
+            )
+        )
+        min_trim_end = current_trim_start + 0.1
+        if candidate_duration > 0:
+            current_trim_end = min(current_trim_end, candidate_duration)
+        current_trim_end = max(current_trim_end, min_trim_end)
+        segment_edit["trim_start"] = current_trim_start
+        segment_edit["trim_end"] = current_trim_end
+        segment_edit["text"] = segment_edit.get("text", segment.get("text", ""))
+        st.session_state[trim_start_key] = current_trim_start
+        st.session_state[trim_end_key] = current_trim_end
+        st.session_state[text_key] = segment_edit["text"]
+
+        segment_states[segment_index] = {
+            "candidates": candidates,
+            "candidate_ids": candidate_ids,
+            "edit_state": segment_edit,
+            "choice_key": choice_key,
+            "choice_widget_key": choice_widget_key,
+            "trim_start_key": trim_start_key,
+            "trim_end_key": trim_end_key,
+            "text_key": text_key,
+            "selected_candidate": selected_candidate,
+            "default_candidate_id": default_candidate_id,
+            "default_trim_start": current_trim_start,
+            "default_trim_end": current_trim_end,
+            "default_text": segment.get("text", ""),
+        }
+
+    if not segment_states:
+        st.error("没有可用候选素材。")
+        return
+
+    active_segment_index = int(
+        st.session_state.get("active_candidate_segment_index")
+        or next(iter(segment_states))
+    )
+    if active_segment_index not in segment_states:
+        active_segment_index = next(iter(segment_states))
+        st.session_state["active_candidate_segment_index"] = active_segment_index
+
+    st.caption(f"已准备 {len(matched_segments)} 句；时间轴只加载缩略图，选中段落才加载视频预览。")
+    with st.container(
+        horizontal=True,
+        horizontal_alignment="left",
+        vertical_alignment="top",
+        gap="small",
+    ):
+        for segment_index, segment in segment_by_index.items():
+            state = segment_states.get(segment_index)
+            visible_term = _segment_display_term(segment, display_terms, segment_index)
+            is_active = segment_index == active_segment_index
+
+            with st.container(border=True, width=220):
+                marker_class = "candidate-timeline-card"
+                if is_active:
+                    marker_class += " candidate-timeline-active"
+                st.markdown(
+                    f'<span class="{marker_class}"></span>',
+                    unsafe_allow_html=True,
+                )
+
+                if state:
+                    thumbnail_url = _timeline_thumbnail_url(
+                        segment, state["selected_candidate"]
                     )
-                    if candidate.get("reason"):
-                        st.caption(candidate["reason"])
+                else:
+                    thumbnail_url = ""
+                _render_timeline_thumbnail(thumbnail_url, visible_term)
 
-            default_candidate_id = candidates[0].get("candidate_id", "")
-            selected_candidate_id = st.radio(
-                "选择候选视频",
-                options=[candidate.get("candidate_id", "") for candidate in candidates],
-                index=0,
-                key=f"candidate_choice_{segment_index}",
-                horizontal=True,
-                format_func=lambda candidate_id, items=candidates: next(
-                    (
-                        _candidate_preview_caption(item)
-                        for item in items
-                        if item.get("candidate_id") == candidate_id
-                    ),
-                    candidate_id,
-                ),
-            ) or default_candidate_id
+                st.markdown(
+                    f'<div class="candidate-timeline-meta">第 {segment_index} 段 · '
+                    f'{float(segment.get("duration") or 0):.2f}s</div>',
+                    unsafe_allow_html=True,
+                )
+                _render_candidate_timeline_text(
+                    "关键词：",
+                    _truncate_clip_text(visible_term, 20),
+                    "candidate-timeline-term",
+                )
+                _render_candidate_timeline_text(
+                    "脚本：",
+                    _truncate_clip_text(segment.get("text", ""), 36),
+                    "candidate-timeline-script",
+                )
 
-            selected_candidate = next(
+                if state:
+                    button_label = (
+                        f"正在编辑第 {segment_index} 段"
+                        if is_active
+                        else f"编辑第 {segment_index} 段"
+                    )
+                    if st.button(
+                        button_label,
+                        key=f"timeline_select_{segment_index}",
+                        type="primary" if is_active else "secondary",
+                        width="stretch",
+                    ):
+                        if not is_active:
+                            st.session_state[
+                                "active_candidate_segment_index"
+                            ] = segment_index
+                            st.rerun()
+                else:
+                    st.button(
+                        "无候选素材",
+                        key=f"timeline_missing_{segment_index}",
+                        disabled=True,
+                        width="stretch",
+                    )
+
+    active_segment = segment_by_index.get(active_segment_index) or {}
+    active_state = segment_states[active_segment_index]
+    candidates = active_state["candidates"]
+    candidate_ids = active_state["candidate_ids"]
+    choice_key = active_state["choice_key"]
+    choice_widget_key = active_state["choice_widget_key"]
+    trim_start_key = active_state["trim_start_key"]
+    trim_end_key = active_state["trim_end_key"]
+    text_key = active_state["text_key"]
+    default_candidate_id = active_state["default_candidate_id"]
+    visible_term = _segment_display_term(
+        active_segment, display_terms, active_segment_index
+    )
+    material_query = str(active_segment.get("term") or "").strip()
+    providers_label = ", ".join(
+        preproduction.normalize_provider_list(active_segment.get("providers"))
+    )
+
+    with st.container(border=True):
+        st.markdown(
+            f"**{active_segment_index}. {active_segment.get('text', '')}**  \n"
+            f"关键词：`{visible_term}` · 当前时长："
+            f"{float(active_segment.get('duration') or 0):.2f}s  \n"
+            f"素材搜索词：`{material_query}` · 素材库：`{providers_label}`"
+        )
+        requested_providers = preproduction.normalize_provider_list(
+            active_segment.get("providers")
+        )
+        available_providers = {
+            str(candidate.get("provider") or "").strip().lower()
+            for candidate in candidates
+        }
+        if "x" in requested_providers and "x" not in available_providers:
+            st.warning(
+                "这一句没有返回可预览的 X 视频候选。可以换更贴近 X 的搜索词，"
+                "或者在 CSV/预生产计划里粘贴具体 x.com 推文链接。"
+            )
+
+        default_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.get("is_default_group")
+        ]
+        other_candidates = [
+            candidate
+            for candidate in candidates
+            if not candidate.get("is_default_group")
+        ]
+        if not default_candidates:
+            default_candidates = candidates[:3]
+            other_candidates = candidates[3:]
+
+        _render_candidate_preview_group(default_candidates)
+        if other_candidates:
+            other_label = other_candidates[0].get("orientation_label") or "其他"
+            with st.expander(f"其他{other_label}候选", expanded=False):
+                _render_candidate_preview_group(other_candidates)
+
+        selected_candidate_id = st.selectbox(
+            "选择候选视频",
+            options=candidate_ids,
+            index=candidate_ids.index(active_state["edit_state"]["candidate_id"]),
+            key=choice_widget_key,
+            format_func=lambda candidate_id, items=candidates: next(
                 (
-                    candidate
-                    for candidate in candidates
-                    if candidate.get("candidate_id") == selected_candidate_id
+                    _candidate_preview_caption(item)
+                    for item in items
+                    if item.get("candidate_id") == candidate_id
                 ),
-                candidates[0],
-            )
-            candidate_duration = float(selected_candidate.get("duration") or 0.0)
-            trim_start_key = f"trim_start_{segment_index}"
-            trim_end_key = f"trim_end_{segment_index}"
-            max_trim_start = (
-                max(candidate_duration - 0.1, 0.0)
-                if candidate_duration > 0.1
-                else None
-            )
-            current_trim_start = max(
-                float(st.session_state.get(trim_start_key, 0.0)), 0.0
-            )
-            if max_trim_start is not None:
-                current_trim_start = min(current_trim_start, max_trim_start)
-            current_trim_end = float(
-                st.session_state.get(
-                    trim_end_key,
-                    candidate_duration
-                    or max(float(segment.get("duration") or 1.0), 1.0),
-                )
-            )
-            min_trim_end = current_trim_start + 0.1
-            if candidate_duration > 0:
-                current_trim_end = min(current_trim_end, candidate_duration)
-            current_trim_end = max(current_trim_end, min_trim_end)
-            if trim_start_key in st.session_state:
-                st.session_state[trim_start_key] = current_trim_start
-            if trim_end_key in st.session_state:
-                st.session_state[trim_end_key] = current_trim_end
+                candidate_id,
+            ),
+        ) or default_candidate_id
+        active_state["edit_state"]["candidate_id"] = selected_candidate_id
+        st.session_state[choice_key] = selected_candidate_id
 
-            trim_cols = st.columns(2)
-            with trim_cols[0]:
-                trim_start = st.number_input(
-                    "裁剪开始秒",
-                    min_value=0.0,
-                    max_value=max_trim_start,
-                    value=current_trim_start,
-                    step=0.1,
-                    key=trim_start_key,
-                )
-            with trim_cols[1]:
-                trim_end = st.number_input(
-                    "裁剪结束秒",
-                    min_value=float(trim_start) + 0.1,
-                    max_value=candidate_duration if candidate_duration > 0 else None,
-                    value=current_trim_end,
-                    step=0.1,
-                    key=trim_end_key,
-                )
+        selected_candidate = _selected_candidate_for_segment(
+            candidates, selected_candidate_id
+        )
+        candidate_duration = float(selected_candidate.get("duration") or 0.0)
+        max_trim_start = (
+            max(candidate_duration - 0.1, 0.0)
+            if candidate_duration > 0.1
+            else None
+        )
+        current_trim_start = min(
+            max(float(st.session_state.get(trim_start_key, 0.0)), 0.0),
+            max_trim_start if max_trim_start is not None else float("inf"),
+        )
+        current_trim_end = float(
+            st.session_state.get(
+                trim_end_key,
+                candidate_duration
+                or max(float(active_segment.get("duration") or 1.0), 1.0),
+            )
+        )
+        min_trim_end = current_trim_start + 0.1
+        if candidate_duration > 0:
+            current_trim_end = min(current_trim_end, candidate_duration)
+        current_trim_end = max(current_trim_end, min_trim_end)
+        st.session_state[trim_start_key] = current_trim_start
+        st.session_state[trim_end_key] = current_trim_end
 
-            edited_text = st.text_area(
-                "单句字幕 / 配音文本",
-                value=segment.get("text", ""),
-                height=90,
-                key=f"segment_text_{segment_index}",
-            )
-            selections.append(
-                {
-                    "segment_index": segment_index,
-                    "candidate_id": selected_candidate_id,
-                    "trim_start": float(trim_start),
-                    "trim_end": float(trim_end),
-                    "text": edited_text,
-                }
-            )
+        trim_cols = st.columns(2)
+        with trim_cols[0]:
+            trim_start_kwargs = {
+                "min_value": 0.0,
+                "max_value": max_trim_start,
+                "step": 0.1,
+                "key": trim_start_key,
+            }
+            current_trim_start = st.number_input("裁剪开始秒", **trim_start_kwargs)
+        with trim_cols[1]:
+            trim_end_kwargs = {
+                "min_value": float(current_trim_start) + 0.1,
+                "max_value": candidate_duration if candidate_duration > 0 else None,
+                "step": 0.1,
+                "key": trim_end_key,
+            }
+            current_trim_end = st.number_input("裁剪结束秒", **trim_end_kwargs)
+
+        text_area_kwargs = {"height": 90, "key": text_key}
+        edited_text = st.text_area("单句字幕 / 配音文本", **text_area_kwargs)
+        active_state["edit_state"]["trim_start"] = float(current_trim_start)
+        active_state["edit_state"]["trim_end"] = float(current_trim_end)
+        active_state["edit_state"]["text"] = edited_text
+
+    selections = []
+    for segment_index, state in segment_states.items():
+        segment_edit = state["edit_state"]
+        selections.append(
+            {
+                "segment_index": segment_index,
+                "candidate_id": segment_edit.get("candidate_id")
+                or state["default_candidate_id"],
+                "trim_start": float(segment_edit.get("trim_start", 0.0)),
+                "trim_end": float(segment_edit.get("trim_end", 0.0)),
+                "text": segment_edit.get("text", state["default_text"]),
+            }
+        )
 
     st.session_state["candidate_selections"] = selections
 
 
+def _render_preproduction_editor():
+    if "preproduction_csv_text_next" in st.session_state:
+        st.session_state["preproduction_csv_text"] = st.session_state.pop(
+            "preproduction_csv_text_next"
+        )
+    rows = preproduction.normalize_preproduction_rows(
+        st.session_state.get("preproduction_rows") or []
+    )
+    with st.expander("CSV / 预生产计划", expanded=bool(rows)):
+        st.caption(
+            "可上传或粘贴 CSV。这里是进入剪辑前的计划表：每段脚本、中文关键词、素材搜索词和素材库会先确认好。"
+        )
+        uploaded_csv = st.file_uploader(
+            "上传 CSV / TSV",
+            type=["csv", "tsv", "txt"],
+            key="preproduction_csv_upload",
+        )
+        st.text_area(
+            "粘贴 CSV",
+            key="preproduction_csv_text",
+            height=150,
+            help="字段：segment_index,title,script,keyword_cn,material_query,providers,source_urls,duration_sec,preferred_orientation,notes",
+        )
+        parse_cols = st.columns(3)
+        with parse_cols[0]:
+            parse_clicked = st.button("解析为预生产计划", width="stretch")
+        with parse_cols[1]:
+            default_clicked = st.button("填入默认 CSV", width="stretch")
+        with parse_cols[2]:
+            clear_clicked = st.button("清除预生产计划", width="stretch")
+
+        if default_clicked:
+            st.session_state["preproduction_csv_text_next"] = _default_preproduction_csv()
+            st.session_state["preproduction_rows"] = preproduction.parse_preproduction_csv(
+                st.session_state["preproduction_csv_text_next"]
+            )
+            _sync_preproduction_rows_to_inputs(st.session_state["preproduction_rows"])
+            st.rerun()
+
+        if clear_clicked:
+            st.session_state["preproduction_rows"] = []
+            st.rerun()
+
+        if parse_clicked:
+            csv_text = ""
+            if uploaded_csv is not None:
+                csv_text = uploaded_csv.getvalue().decode("utf-8-sig", errors="replace")
+            else:
+                csv_text = st.session_state.get("preproduction_csv_text", "")
+            parsed_rows = preproduction.parse_preproduction_csv(csv_text)
+            if parsed_rows:
+                st.session_state["preproduction_rows"] = parsed_rows
+                _sync_preproduction_rows_to_inputs(parsed_rows)
+                st.success(f"已解析 {len(parsed_rows)} 段预生产计划。")
+                st.rerun()
+            else:
+                st.warning("没有解析到有效行，请检查 CSV 表头和内容。")
+
+        rows = preproduction.normalize_preproduction_rows(
+            st.session_state.get("preproduction_rows") or []
+        )
+        if not rows:
+            return
+
+        signature = preproduction.build_preproduction_plan(rows).get("signature", "")
+        edited_rows = st.data_editor(
+            _preproduction_editor_rows(rows),
+            hide_index=True,
+            width="stretch",
+            num_rows="dynamic",
+            key=f"preproduction_plan_editor_{signature}",
+            column_config={
+                "segment_index": st.column_config.NumberColumn("段", width="small"),
+                "script": st.column_config.TextColumn("脚本", width="large"),
+                "keyword_cn": st.column_config.TextColumn("中文关键词", width="medium"),
+                "material_query": st.column_config.TextColumn("素材搜索词", width="medium"),
+                "providers": st.column_config.TextColumn("素材库", width="small"),
+                "source_urls": st.column_config.TextColumn("来源链接", width="medium"),
+                "duration_sec": st.column_config.NumberColumn("时长", width="small"),
+                "preferred_orientation": st.column_config.TextColumn("方向", width="small"),
+                "notes": st.column_config.TextColumn("备注", width="medium"),
+            },
+        )
+        normalized_rows = _preproduction_rows_from_editor(edited_rows)
+        if normalized_rows:
+            st.session_state["preproduction_rows"] = normalized_rows
+            _sync_preproduction_rows_to_inputs(normalized_rows)
+            providers = sorted(_providers_required_for_prepare())
+            st.caption(
+                f"当前计划：{len(normalized_rows)} 段；素材库：{', '.join(providers)}。表格是候选素材准备的来源。"
+            )
+
+
 def _render_simple_editor():
     st.markdown("### 视频生成")
+    if st.button("填入测试默认值"):
+        st.session_state["video_subject"] = DEFAULT_TEST_VIDEO_SUBJECT
+        st.session_state["video_script"] = DEFAULT_TEST_VIDEO_SCRIPT
+        st.session_state["video_terms"] = DEFAULT_TEST_VIDEO_TERMS
+        st.session_state["preproduction_csv_text"] = _default_preproduction_csv()
+        st.session_state["preproduction_rows"] = []
+        st.session_state["simple_voice_rate_percent"] = 0
+        st.session_state["simple_voice_rate"] = 1.0
+        st.session_state.pop("script_keyword_match_signature", None)
+        st.session_state.pop("script_keyword_matches", None)
+        st.session_state.pop("candidate_task_id", None)
+        st.session_state.pop("candidate_task_data", None)
+        st.session_state.pop("candidate_selections", None)
+        st.rerun()
+
+    _render_preproduction_editor()
+
     st.text_input("标题", key="video_subject", placeholder="例如：中国五大城市实力排名")
     st.text_area(
-        "Scripts",
+        "脚本",
         key="video_script",
         height=300,
         placeholder="每一句单独成段，逐句匹配素材会更稳定。",
@@ -500,11 +1446,31 @@ def _render_simple_editor():
         "关键词",
         key="video_terms",
         height=150,
-        placeholder="每句一个关键词，用英文逗号分隔。例如：Shanghai skyline, Beijing CBD...",
+        placeholder="每句一个关键词，可以写中文，用逗号分隔。例如：广州城市天际线，北京天安门城市...",
     )
+    if _preproduction_plan_from_session():
+        st.caption("已启用 CSV / 预生产计划；逐句脚本、中文关键词、素材搜索词和素材库请在上方表格调整。")
+    else:
+        refresh_match_clicked = st.button("更新关键词匹配预览")
+        _render_script_keyword_match_editor(force_refresh=refresh_match_clicked)
+        st.multiselect(
+            "候选素材来源",
+            options=list(SIMPLE_CANDIDATE_PROVIDER_OPTIONS),
+            key="simple_candidate_providers",
+            format_func=_candidate_provider_label,
+            help="选择 X 后，准备候选素材时会通过 AgentReach/twitter-cli 搜索 X 视频，并在候选预览里按来源分组展示。",
+        )
+        selected_providers = _selected_simple_candidate_providers()
+        config.app["candidate_preview_providers"] = selected_providers
+        if "x" in selected_providers:
+            config.app["enable_x_materials"] = True
+            st.caption(
+                "已选择 X：候选准备会同时搜索 X 视频；如果某句没有 X 结果，仍会保留其他素材源。"
+            )
+    _render_voice_rate_control()
 
     with st.expander("高级设置", expanded=False):
-        st.caption("默认使用 Pexels、9:16、顺序拼接、无转场、无 BGM、开启字幕和逐句匹配。")
+        st.caption("默认使用 Pexels、9:16、顺序拼接、无转场、无 BGM、开启字幕和逐句匹配。CSV 计划可为每段指定 X/Pexels 等素材库。")
         pexels_keys = _as_list_config_value("pexels_api_keys")
         config.app["pexels_api_keys"] = pexels_keys
         new_pexels_key = st.text_input("Pexels API Key", type="password")
@@ -518,6 +1484,42 @@ def _render_simple_editor():
             else:
                 st.warning("请输入有效的 Pexels Key")
 
+        config.app["enable_x_materials"] = st.checkbox(
+            "启用 X 素材库",
+            value=bool(
+                config.app.get("enable_x_materials", True)
+                or "x" in _selected_simple_candidate_providers()
+            ),
+            help="通过外部 AgentReach/twitter-cli/OpenCLI 读取 X 视频候选；不会把 AgentReach 源码复制进项目。",
+        )
+        config.app["agent_reach_command"] = st.text_input(
+            "AgentReach 命令",
+            value=str(config.app.get("agent_reach_command", "agent-reach")),
+            help="默认使用 PATH 里的 agent-reach；如果不可用，会尝试同级 Agent-Reach repo。",
+        )
+        config.app["x_search_limit"] = st.number_input(
+            "X 搜索数量",
+            min_value=1,
+            max_value=50,
+            value=int(config.app.get("x_search_limit", 10) or 10),
+            step=1,
+        )
+        config.app["x_timeout_seconds"] = st.number_input(
+            "X/AgentReach 超时秒数",
+            min_value=3,
+            max_value=120,
+            value=int(config.app.get("x_timeout_seconds", 20) or 20),
+            step=1,
+        )
+        config.app["x_cache_policy"] = st.selectbox(
+            "X 候选缓存策略",
+            options=["task", "off"],
+            index=0
+            if str(config.app.get("x_cache_policy", "task")).lower() != "off"
+            else 1,
+            help="task 会把 X top 候选视频缓存到任务目录，预览和渲染更稳定。",
+        )
+
         aspect_options = [item.value for item in VideoAspect]
         st.selectbox(
             "画面比例",
@@ -528,17 +1530,9 @@ def _render_simple_editor():
             key="simple_video_aspect",
         )
         st.text_input(
-            "Voice",
+            "配音声音",
             value=config.ui.get("voice_name", "en-AU-NatashaNeural-Female"),
             key="simple_voice_name",
-        )
-        st.slider(
-            "语速",
-            min_value=0.5,
-            max_value=2.0,
-            value=float(st.session_state.get("simple_voice_rate", 1.0)),
-            step=0.1,
-            key="simple_voice_rate",
         )
         st.number_input(
             "旧模式最大片段时长 / 候选搜索最小时长",
@@ -558,19 +1552,26 @@ def _render_simple_editor():
     action_cols = st.columns(2)
     with action_cols[0]:
         prepare_clicked = st.button(
-            "准备候选素材", use_container_width=True, type="primary"
+            "准备候选素材", width="stretch", type="primary"
         )
     with action_cols[1]:
-        render_clicked = st.button("渲染最终视频", use_container_width=True)
+        render_clicked = st.button("渲染最终视频", width="stretch")
 
     if prepare_clicked:
         config.save_config()
         params = _build_editor_params()
         if not params.video_subject and not params.video_script:
-            st.error("标题和 scripts 不能同时为空。")
+            st.error("标题和脚本不能同时为空。")
             st.stop()
-        if not _as_list_config_value("pexels_api_keys"):
+        required_providers = _providers_required_for_prepare()
+        if "pexels" in required_providers and not _as_list_config_value("pexels_api_keys"):
             st.error("请先在高级设置里保存 Pexels API Key。")
+            st.stop()
+        if "pixabay" in required_providers and not _as_list_config_value("pixabay_api_keys"):
+            st.error("当前预生产计划使用 Pixabay，请先在配置里保存 Pixabay API Key。")
+            st.stop()
+        if "coverr" in required_providers and not _as_list_config_value("coverr_api_keys"):
+            st.error("当前预生产计划使用 Coverr，请先在配置里保存 Coverr API Key。")
             st.stop()
 
         task_id = str(uuid4())
@@ -612,6 +1613,7 @@ def _render_simple_editor():
             tm.render_selection(
                 task_id=task_id,
                 selections=selections,
+                voice_rate=_simple_voice_rate_value(),
                 progress_callback=progress_update,
             )
         task_data = _load_candidate_task(task_id) or {}
@@ -1262,6 +2264,7 @@ with middle_panel:
             (tr("Pexels"), "pexels"),
             (tr("Pixabay"), "pixabay"),
             (tr("Coverr"), "coverr"),
+            ("X", "x"),
             (tr("Local file"), "local"),
             (tr("TikTok"), "douyin"),
             (tr("Bilibili"), "bilibili"),
@@ -1890,7 +2893,7 @@ with right_panel:
                     config.save_config()
                     st.success(tr("Coverr API Key deleted successfully"))
 
-start_button = st.button(tr("Generate Video"), use_container_width=True, type="primary")
+start_button = st.button(tr("Generate Video"), width="stretch", type="primary")
 if start_button:
     config.save_config()
     task_id = str(uuid4())
@@ -1899,7 +2902,7 @@ if start_button:
         scroll_to_bottom()
         st.stop()
 
-    if params.video_source not in ["pexels", "pixabay", "coverr", "local"]:
+    if params.video_source not in ["pexels", "pixabay", "coverr", "local", "x"]:
         st.error(tr("Please Select a Valid Video Source"))
         scroll_to_bottom()
         st.stop()

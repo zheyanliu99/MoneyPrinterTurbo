@@ -69,24 +69,33 @@ class TestTaskService(unittest.TestCase):
             match_script_order=True,
         )
 
-    def test_generate_terms_regenerates_mismatched_manual_terms(self):
+    def test_build_script_keyword_matches_prefers_place_overlap(self):
+        matches = tm.build_script_keyword_matches(
+            video_script="广州是华南重要城市。北京拥有天安门广场。",
+            video_terms="Beijing Tiananmen Square, Guangzhou skyline, subway station",
+            video_subject="中国城市",
+            preserve_equal_count_order=False,
+        )
+
+        self.assertEqual(
+            [match["term"] for match in matches],
+            ["Guangzhou skyline", "Beijing Tiananmen Square"],
+        )
+        self.assertGreater(matches[0]["score"], 0)
+
+    def test_generate_terms_matches_mismatched_manual_terms_locally(self):
         params = VideoParams(
             video_subject="纽约旅行",
             video_script="",
-            video_terms="city skyline",
+            video_terms="city skyline, Central Park, subway station",
             match_materials_to_script=True,
         )
 
-        with patch.object(tm.llm, "generate_terms", return_value=["skyline", "park"]) as generate:
+        with patch.object(tm.llm, "generate_terms") as generate:
             result = tm.generate_terms("task-id", params, "See the skyline. Visit the park.")
 
-        self.assertEqual(result, ["skyline", "park"])
-        generate.assert_called_once_with(
-            video_subject="纽约旅行",
-            video_script="See the skyline. Visit the park.",
-            amount=2,
-            match_script_order=True,
-        )
+        self.assertEqual(result, ["city skyline", "Central Park"])
+        generate.assert_not_called()
 
     def test_generate_terms_translates_chinese_terms_for_online_sources(self):
         params = VideoParams(
@@ -105,28 +114,116 @@ class TestTaskService(unittest.TestCase):
             )
 
         self.assertEqual(result, ["Guangzhou city skyline", "Chongqing mountain city aerial"])
+        self.assertEqual(params.video_terms, ["广州城市天际线", "重庆山城航拍"])
         generate.assert_not_called()
 
-    def test_generate_terms_regenerates_mismatched_chinese_terms_for_online_sources(self):
+    def test_generate_terms_matches_mismatched_chinese_terms_for_online_sources(self):
         params = VideoParams(
             video_subject="中国城市",
             video_script="",
-            video_terms="广州城市天际线",
+            video_terms="广州城市天际线，重庆山城航拍，深圳科技",
             video_source="coverr",
             match_materials_to_script=True,
         )
 
-        with patch.object(
-            tm.llm, "generate_terms", return_value=["Guangzhou skyline", "Chongqing aerial"]
-        ) as generate:
+        with patch.object(tm.llm, "generate_terms") as generate:
             result = tm.generate_terms(
                 "task-id",
                 params,
                 "第五广州常住人口约1898万人。第四重庆常住人口约3190万人。",
             )
 
-        self.assertEqual(result, ["Guangzhou skyline", "Chongqing aerial"])
-        generate.assert_called_once()
+        self.assertEqual(result, ["Guangzhou city skyline", "Chongqing mountain city aerial"])
+        self.assertEqual(params.video_terms, ["广州城市天际线", "重庆山城航拍"])
+        generate.assert_not_called()
+
+    def test_generate_terms_normalizes_guangdong_skylight_to_city_skyline(self):
+        params = VideoParams(
+            video_subject="中国城市",
+            video_script="",
+            video_terms="广东skylight",
+            video_source="pexels",
+            match_materials_to_script=True,
+        )
+
+        with patch.object(tm.llm, "generate_terms") as generate:
+            result = tm.generate_terms(
+                "task-id",
+                params,
+                "广东的城市天际线展现出华南经济活力。",
+            )
+
+        self.assertEqual(result, ["Guangdong Guangzhou skyline"])
+        self.assertEqual(params.video_terms, ["广东skylight"])
+        generate.assert_not_called()
+
+    def test_generate_terms_uses_preproduction_plan_queries(self):
+        params = VideoParams(
+            video_subject="城市视频",
+            video_script="广州GDP增长。\n北京历史地标。",
+            video_source="pexels",
+            match_materials_to_script=True,
+            preproduction_plan={
+                "segments": [
+                    {
+                        "segment_index": 1,
+                        "script": "广州GDP增长。",
+                        "keyword_cn": "广州CBD天际线",
+                        "material_query": "Guangzhou CBD skyline",
+                        "providers": ["x", "pexels"],
+                    },
+                    {
+                        "segment_index": 2,
+                        "script": "北京历史地标。",
+                        "keyword_cn": "北京天安门",
+                        "material_query": "Beijing Tiananmen Square",
+                        "providers": ["pexels"],
+                    },
+                ]
+            },
+        )
+
+        with patch.object(tm.llm, "generate_terms") as generate:
+            result = tm.generate_terms("task-id", params, params.video_script)
+
+        self.assertEqual(result, ["Guangzhou CBD skyline", "Beijing Tiananmen Square"])
+        self.assertEqual(params.video_terms, ["广州CBD天际线", "北京天安门"])
+        generate.assert_not_called()
+
+    def test_preproduction_plan_metadata_is_applied_to_segments(self):
+        params = VideoParams(
+            video_subject="城市视频",
+            preproduction_plan={
+                "segments": [
+                    {
+                        "segment_index": 1,
+                        "title": "城市视频",
+                        "script": "广州GDP增长。",
+                        "keyword_cn": "广州CBD天际线",
+                        "material_query": "Guangzhou CBD skyline",
+                        "providers": ["x", "pexels"],
+                        "source_urls": ["https://x.com/citycam/status/123"],
+                        "notes": "prefer landmark",
+                    }
+                ]
+            },
+        )
+        segments = [
+            {
+                "index": 1,
+                "text": "广州GDP增长。",
+                "term": "old term",
+                "display_term": "old display",
+            }
+        ]
+
+        result = tm._apply_preproduction_plan_to_segments(segments, params)
+
+        self.assertEqual(result[0]["term"], "Guangzhou CBD skyline")
+        self.assertEqual(result[0]["display_term"], "广州CBD天际线")
+        self.assertEqual(result[0]["providers"], ["x", "pexels"])
+        self.assertEqual(result[0]["source_urls"], ["https://x.com/citycam/status/123"])
+        self.assertEqual(result[0]["notes"], "prefer landmark")
 
     def test_chinese_script_with_english_voice_uses_chinese_fallback_voice(self):
         result = tm._resolve_voice_name_for_script(
@@ -167,10 +264,32 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(segments[0]["index"], 1)
         self.assertEqual(segments[0]["text"], "See the Statue of Liberty")
         self.assertEqual(segments[0]["term"], "Statue of Liberty")
+        self.assertEqual(segments[0]["display_term"], "Statue of Liberty")
         self.assertEqual(segments[0]["start"], 0.0)
         self.assertEqual(segments[0]["end"], 2.5)
         self.assertEqual(segments[0]["duration"], 2.5)
         self.assertEqual(segments[0]["material"], "")
+
+    def test_build_matched_segments_keeps_display_terms_separate_from_search_terms(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            subtitle_path = Path(temp_dir) / "subtitle.srt"
+            subtitle_path.write_text(
+                "1\n"
+                "00:00:00,000 --> 00:00:02,500\n"
+                "2024年GDP约3.10万亿元。\n\n",
+                encoding="utf-8",
+            )
+
+            segments = tm.build_matched_segments(
+                video_script="2024年GDP约3.10万亿元。",
+                video_terms=["Guangzhou CBD skyline"],
+                subtitle_path=str(subtitle_path),
+                display_terms=["广州CBD天际线"],
+            )
+
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0]["term"], "Guangzhou CBD skyline")
+        self.assertEqual(segments[0]["display_term"], "广州CBD天际线")
 
     def test_write_audio_segment_files_decodes_mp3_without_ffprobe(self):
         """
@@ -312,6 +431,244 @@ class TestTaskService(unittest.TestCase):
                         }
                     ],
                 )
+        finally:
+            shutil.rmtree(task_dir, ignore_errors=True)
+
+    def test_render_selection_accepts_candidate_from_other_orientation_group(self):
+        task_id = "render-selection-other-orientation"
+        task_dir = tm.utils.task_dir(task_id)
+        audio_file = os.path.join(task_dir, "segment-001.mp3")
+        os.makedirs(task_dir, exist_ok=True)
+        Path(audio_file).write_bytes(b"fake-audio")
+        params = VideoParams(
+            video_subject="editor",
+            video_script="One line.",
+            video_terms="city",
+            video_source="pexels",
+            match_materials_to_script=True,
+        )
+        matched_segments = [
+            {
+                "index": 1,
+                "text": "One line.",
+                "term": "city",
+                "start": 0.0,
+                "end": 1.0,
+                "duration": 1.0,
+                "material": "",
+                "candidates": [
+                    {
+                        "candidate_id": "seg-1-cand-1",
+                        "rank": 1,
+                        "group_rank": 1,
+                        "orientation": "portrait",
+                        "is_default_group": True,
+                        "material": "",
+                        "source_url": "https://example.com/portrait.mp4",
+                        "preview_url": "https://example.com/portrait.mp4",
+                        "duration": 5,
+                        "provider": "pexels",
+                    },
+                    {
+                        "candidate_id": "seg-1-cand-4",
+                        "rank": 4,
+                        "group_rank": 1,
+                        "orientation": "landscape",
+                        "is_default_group": False,
+                        "material": "",
+                        "source_url": "https://example.com/landscape.mp4",
+                        "preview_url": "https://example.com/landscape.mp4",
+                        "duration": 5,
+                        "provider": "pexels",
+                    },
+                ],
+                "audio_segment": {
+                    "file": audio_file,
+                    "pause_before": 0.0,
+                    "original_text": "One line.",
+                },
+            }
+        ]
+
+        class FakeAudio:
+            def __init__(self, duration_ms=1000):
+                self.duration_ms = duration_ms
+
+            def __len__(self):
+                return self.duration_ms
+
+            def __add__(self, other):
+                return FakeAudio(self.duration_ms + len(other))
+
+            def export(self, output_path, format):
+                Path(output_path).write_bytes(b"fake-audio")
+                return None
+
+        try:
+            tm.save_script_data(
+                task_id,
+                "One line.",
+                ["city"],
+                params,
+                matched_segments=matched_segments,
+                extra={"audio_tail_pause": 0},
+            )
+
+            with (
+                patch.object(
+                    tm,
+                    "_materialize_remote_candidate",
+                    return_value="/tmp/landscape.mp4",
+                ) as materialize,
+                patch("pydub.AudioSegment.empty", return_value=FakeAudio(0)),
+                patch("pydub.AudioSegment.silent", side_effect=lambda duration: FakeAudio(duration)),
+                patch("pydub.AudioSegment.from_file", return_value=FakeAudio(1000)),
+                patch.object(tm.voice, "_configure_pydub_ffmpeg"),
+                patch.object(tm.voice, "get_audio_duration", return_value=1.0),
+                patch.object(
+                    tm,
+                    "generate_final_videos",
+                    return_value=(["/tmp/final.mp4"], ["/tmp/combined.mp4"]),
+                ),
+                patch.object(tm, "_cleanup_final_only_artifacts"),
+                patch.object(tm.sm.state, "update_task"),
+            ):
+                result = tm._render_selection_impl(
+                    task_id,
+                    [
+                        {
+                            "segment_index": 1,
+                            "candidate_id": "seg-1-cand-4",
+                            "trim_start": 0,
+                            "trim_end": 1,
+                            "text": "One line.",
+                        }
+                    ],
+                )
+
+            selected_candidate = materialize.call_args.kwargs["candidate"]
+            self.assertEqual(selected_candidate["orientation"], "landscape")
+            self.assertEqual(
+                result["matched_segments"][0]["candidate_id"], "seg-1-cand-4"
+            )
+            self.assertEqual(
+                result["matched_segments"][0]["material_source_url"],
+                "https://example.com/landscape.mp4",
+            )
+        finally:
+            shutil.rmtree(task_dir, ignore_errors=True)
+
+    def test_render_selection_regenerates_audio_when_voice_rate_changes(self):
+        task_id = "render-selection-voice-rate-change"
+        task_dir = tm.utils.task_dir(task_id)
+        audio_file = os.path.join(task_dir, "segment-001.mp3")
+        os.makedirs(task_dir, exist_ok=True)
+        Path(audio_file).write_bytes(b"fake-audio")
+        params = VideoParams(
+            video_subject="editor",
+            video_script="One line.",
+            video_terms="city",
+            video_source="pexels",
+            match_materials_to_script=True,
+            voice_rate=1.0,
+        )
+        matched_segments = [
+            {
+                "index": 1,
+                "text": "One line.",
+                "term": "city",
+                "start": 0.0,
+                "end": 1.0,
+                "duration": 1.0,
+                "material": "",
+                "candidates": [
+                    {
+                        "candidate_id": "seg-1-cand-1",
+                        "rank": 1,
+                        "material": "",
+                        "source_url": "https://example.com/selected.mp4",
+                        "preview_url": "https://example.com/selected.mp4",
+                        "duration": 5,
+                        "provider": "pexels",
+                    }
+                ],
+                "audio_segment": {
+                    "file": audio_file,
+                    "pause_before": 0.0,
+                    "original_text": "One line.",
+                    "voice_rate": 1.0,
+                },
+            }
+        ]
+
+        class FakeAudio:
+            def __init__(self, duration_ms=1500):
+                self.duration_ms = duration_ms
+
+            def __len__(self):
+                return self.duration_ms
+
+            def __add__(self, other):
+                return FakeAudio(self.duration_ms + len(other))
+
+            def export(self, output_path, format):
+                Path(output_path).write_bytes(b"fake-audio")
+                return None
+
+        def fake_tts(**kwargs):
+            Path(kwargs["voice_file"]).write_bytes(b"regenerated-audio")
+            return object()
+
+        try:
+            tm.save_script_data(
+                task_id,
+                "One line.",
+                ["city"],
+                params,
+                matched_segments=matched_segments,
+                extra={"audio_tail_pause": 0},
+            )
+
+            with (
+                patch.object(
+                    tm,
+                    "_materialize_remote_candidate",
+                    return_value="/tmp/selected.mp4",
+                ),
+                patch("pydub.AudioSegment.empty", return_value=FakeAudio(0)),
+                patch("pydub.AudioSegment.silent", side_effect=lambda duration: FakeAudio(duration)),
+                patch("pydub.AudioSegment.from_file", return_value=FakeAudio(1500)),
+                patch.object(tm.voice, "_configure_pydub_ffmpeg"),
+                patch.object(tm.voice, "tts", side_effect=fake_tts) as tts,
+                patch.object(tm.voice, "get_audio_duration", return_value=1.5),
+                patch.object(
+                    tm,
+                    "generate_final_videos",
+                    return_value=(["/tmp/final.mp4"], ["/tmp/combined.mp4"]),
+                ),
+                patch.object(tm, "_cleanup_final_only_artifacts"),
+                patch.object(tm.sm.state, "update_task"),
+            ):
+                result = tm._render_selection_impl(
+                    task_id,
+                    [
+                        {
+                            "segment_index": 1,
+                            "candidate_id": "seg-1-cand-1",
+                            "trim_start": 0,
+                            "trim_end": 1,
+                            "text": "One line.",
+                        }
+                    ],
+                    voice_rate=1.5,
+                )
+
+            tts.assert_called_once()
+            self.assertEqual(tts.call_args.kwargs["voice_rate"], 1.5)
+            self.assertEqual(result["matched_segments"][0]["duration"], 1.5)
+            self.assertEqual(
+                result["matched_segments"][0]["audio_segment"]["voice_rate"], 1.5
+            )
         finally:
             shutil.rmtree(task_dir, ignore_errors=True)
 

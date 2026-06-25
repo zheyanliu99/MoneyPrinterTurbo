@@ -11,7 +11,7 @@ from loguru import logger
 from app.config import config
 from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
-from app.services import llm, material, subtitle, video, voice, upload_post
+from app.services import llm, material, preproduction, subtitle, video, voice, upload_post
 from app.services import state as sm
 from app.utils import utils
 
@@ -32,6 +32,9 @@ def _emit_progress(
 def generate_script(task_id, params):
     logger.info("\n\n## generating video script")
     video_script = params.video_script.strip()
+    plan = getattr(params, "preproduction_plan", None)
+    if not video_script and isinstance(plan, dict):
+        video_script = str(plan.get("script") or "").strip()
     if not video_script:
         video_script = llm.generate_script(
             video_subject=params.video_subject,
@@ -83,6 +86,7 @@ _CJK_STOCK_SEARCH_TRANSLATIONS = [
     ("小蛮腰", "Canton Tower"),
     ("珠江", "Pearl River"),
     ("长江", "Yangtze River"),
+    ("广东", "Guangdong Guangzhou"),
     ("广州", "Guangzhou"),
     ("重庆", "Chongqing"),
     ("深圳", "Shenzhen"),
@@ -101,6 +105,67 @@ _CJK_STOCK_SEARCH_TRANSLATIONS = [
     ("商都", "commercial city"),
 ]
 
+_KEYWORD_MATCH_STOPWORDS = {
+    "and",
+    "city",
+    "for",
+    "from",
+    "into",
+    "near",
+    "over",
+    "show",
+    "that",
+    "the",
+    "this",
+    "with",
+}
+_KEYWORD_MATCH_ALIASES = [
+    ("广东", ("guangdong", "guangzhou", "canton", "shenzhen", "pearl river")),
+    ("广州", ("guangzhou", "canton", "canton tower", "pearl river")),
+    ("北京", ("beijing", "tiananmen", "forbidden city")),
+    ("天安门", ("tiananmen", "tiananmen square", "beijing")),
+    ("上海", ("shanghai", "lujiazui", "huangpu river")),
+    ("重庆", ("chongqing", "mountain city")),
+    ("深圳", ("shenzhen", "futian")),
+    ("陆家嘴", ("lujiazui", "shanghai")),
+    ("珠江", ("pearl river", "guangzhou", "canton")),
+    ("黄浦江", ("huangpu river", "shanghai")),
+]
+_KEYWORD_PLACE_TOKENS = {
+    "广东",
+    "广州",
+    "北京",
+    "天安门",
+    "上海",
+    "重庆",
+    "深圳",
+    "陆家嘴",
+    "珠江",
+    "黄浦江",
+    "guangdong",
+    "guangzhou",
+    "canton",
+    "beijing",
+    "tiananmen",
+    "shanghai",
+    "lujiazui",
+    "chongqing",
+    "shenzhen",
+    "futian",
+}
+_CITY_SEARCH_CONTEXT_TOKENS = {
+    "guangdong",
+    "guangzhou",
+    "canton",
+    "beijing",
+    "tiananmen",
+    "shanghai",
+    "lujiazui",
+    "chongqing",
+    "shenzhen",
+    "china",
+}
+
 
 def _dedupe_adjacent_words(text: str) -> str:
     words = text.split()
@@ -111,9 +176,127 @@ def _dedupe_adjacent_words(text: str) -> str:
     return " ".join(deduped)
 
 
+def _ascii_keyword_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if len(token) > 2 and token not in _KEYWORD_MATCH_STOPWORDS
+    }
+
+
+def _text_contains_keyword_alias(text: str, alias: str) -> bool:
+    alias = (alias or "").strip().lower()
+    if not alias:
+        return False
+    if _contains_cjk(alias):
+        return alias in (text or "").lower().replace(" ", "")
+    normalized = re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+    alias_text = re.sub(r"[^a-z0-9]+", " ", alias).strip()
+    if not alias_text:
+        return False
+    return bool(re.search(rf"(^|\s){re.escape(alias_text)}($|\s)", normalized))
+
+
+def _expanded_keyword_match_tokens(text: str) -> set[str]:
+    tokens = _ascii_keyword_tokens(text)
+    tokens.update(re.findall(r"[\u3400-\u9fff]{2,}", text or ""))
+
+    for primary, aliases in _KEYWORD_MATCH_ALIASES:
+        alias_values = (primary, *aliases)
+        if any(_text_contains_keyword_alias(text, alias) for alias in alias_values):
+            tokens.add(primary)
+            for alias in aliases:
+                tokens.update(_ascii_keyword_tokens(alias))
+
+    return tokens
+
+
+def _script_keyword_match_score(script_text: str, term: str, subject: str = "") -> float:
+    line_tokens = _expanded_keyword_match_tokens(f"{subject} {script_text}")
+    term_tokens = _expanded_keyword_match_tokens(term)
+    if not term_tokens:
+        return 0.0
+
+    overlap = line_tokens & term_tokens
+    place_overlap = overlap & _KEYWORD_PLACE_TOKENS
+    score = (len(overlap) * 5.0) + (len(place_overlap) * 8.0)
+    normalized_line = re.sub(r"\s+", " ", f"{subject} {script_text}".lower())
+    normalized_term = re.sub(r"\s+", " ", (term or "").lower()).strip()
+    if normalized_term and normalized_term in normalized_line:
+        score += 10.0
+    return score
+
+
+def build_script_keyword_matches(
+    video_script: str,
+    video_terms,
+    video_subject: str = "",
+    preserve_equal_count_order: bool = True,
+) -> list[dict]:
+    script_lines = utils.split_script_to_visual_lines(video_script)
+    terms = _normalize_video_terms(video_terms)
+    if isinstance(terms, str):
+        terms = []
+
+    matches = []
+    if (
+        preserve_equal_count_order
+        and terms
+        and len(terms) == len(script_lines)
+    ):
+        for index, script_line in enumerate(script_lines, start=1):
+            term = terms[index - 1]
+            matches.append(
+                {
+                    "index": index,
+                    "text": script_line,
+                    "term": term,
+                    "score": round(
+                        _script_keyword_match_score(script_line, term, video_subject),
+                        2,
+                    ),
+                    "reason": "按脚本顺序匹配",
+                }
+            )
+        return matches
+
+    for index, script_line in enumerate(script_lines, start=1):
+        best_term = ""
+        best_score = -1.0
+        for term in terms:
+            score = _script_keyword_match_score(script_line, term, video_subject)
+            if score > best_score:
+                best_term = term
+                best_score = score
+
+        if best_term:
+            reason = "按地点/关键词重合度匹配" if best_score > 0 else "无明显重合，使用首个可用关键词"
+        else:
+            reason = "未提供关键词"
+            best_score = 0.0
+        matches.append(
+            {
+                "index": index,
+                "text": script_line,
+                "term": best_term,
+                "score": round(max(best_score, 0.0), 2),
+                "reason": reason,
+            }
+        )
+    return matches
+
+
+def _normalize_stock_search_term(term: str) -> str:
+    normalized = re.sub(r"\s+", " ", (term or "").strip())
+    tokens = _ascii_keyword_tokens(normalized)
+    if "skylight" in tokens and tokens & _CITY_SEARCH_CONTEXT_TOKENS:
+        normalized = re.sub(r"\bskylight\b", "skyline", normalized, flags=re.IGNORECASE)
+    return _dedupe_adjacent_words(normalized)
+
+
 def _translate_cjk_stock_search_term(term: str) -> str:
     if not _contains_cjk(term):
-        return term.strip()
+        return _normalize_stock_search_term(term)
 
     translated = f" {term} "
     for source, replacement in _CJK_STOCK_SEARCH_TRANSLATIONS:
@@ -123,11 +306,23 @@ def _translate_cjk_stock_search_term(term: str) -> str:
     translated = re.sub(r"[^\w\s.-]", " ", translated)
     translated = re.sub(r"\s+", " ", translated).strip()
     translated = _dedupe_adjacent_words(translated)
-    return translated or "China city skyline"
+    return _normalize_stock_search_term(translated or "China city skyline")
 
 
 def _translate_cjk_terms_for_stock_search(video_terms: list[str]) -> list[str]:
     return [_translate_cjk_stock_search_term(term) for term in video_terms]
+
+
+def _stock_search_terms_for_online_source(video_terms: list[str], params) -> list[str]:
+    if not _uses_online_material_source(params) or not video_terms:
+        return video_terms
+    if _terms_contain_cjk(video_terms):
+        logger.warning(
+            "manual video terms contain Chinese text, translating them to "
+            "English stock-video search terms"
+        )
+        return _translate_cjk_terms_for_stock_search(video_terms)
+    return [_normalize_stock_search_term(term) for term in video_terms]
 
 
 def _uses_online_material_source(params) -> bool:
@@ -154,30 +349,23 @@ def _resolve_voice_name_for_script(raw_voice_name: str, video_script: str) -> st
 
 def generate_terms(task_id, params, video_script):
     logger.info("\n\n## generating video terms")
+    plan = getattr(params, "preproduction_plan", None)
+    if isinstance(plan, dict) and plan.get("segments"):
+        normalized_rows = preproduction.normalize_preproduction_rows(
+            plan.get("segments") or []
+        )
+        search_terms = preproduction.rows_to_search_terms(normalized_rows)
+        display_terms = preproduction.rows_to_display_terms(normalized_rows)
+        if search_terms:
+            params.video_terms = display_terms or search_terms
+            logger.debug(f"video terms from preproduction plan: {utils.to_json(search_terms)}")
+            return search_terms
+
     script_lines = utils.split_script_to_visual_lines(video_script)
     expected_term_count = len(script_lines) if params.match_materials_to_script else 5
     video_terms = _normalize_video_terms(params.video_terms)
     if isinstance(video_terms, str):
         return video_terms
-    if _uses_online_material_source(params) and _terms_contain_cjk(video_terms):
-        if (
-            params.match_materials_to_script
-            and video_terms
-            and len(video_terms) != expected_term_count
-        ):
-            logger.warning(
-                "manual Chinese video terms count does not match script sentence "
-                "count, expected: "
-                f"{expected_term_count}, actual: {len(video_terms)}; regenerating"
-            )
-            video_terms = []
-        else:
-            logger.warning(
-                "manual video terms contain Chinese text, translating them to "
-                "English stock-video search terms"
-            )
-            video_terms = _translate_cjk_terms_for_stock_search(video_terms)
-
     if (
         params.match_materials_to_script
         and video_terms
@@ -185,9 +373,19 @@ def generate_terms(task_id, params, video_script):
     ):
         logger.warning(
             "manual video terms count does not match script sentence count, "
-            f"expected: {expected_term_count}, actual: {len(video_terms)}; regenerating"
+            f"expected: {expected_term_count}, actual: {len(video_terms)}; "
+            "matching terms to script locally"
         )
-        video_terms = []
+        video_terms = [
+            match["term"]
+            for match in build_script_keyword_matches(
+                video_script=video_script,
+                video_terms=video_terms,
+                video_subject=params.video_subject,
+                preserve_equal_count_order=False,
+            )
+            if match.get("term")
+        ]
 
     if not video_terms:
         video_terms = llm.generate_terms(
@@ -202,14 +400,19 @@ def generate_terms(task_id, params, video_script):
             return None
         video_terms = _normalize_video_terms(video_terms)
 
-    logger.debug(f"video terms: {utils.to_json(video_terms)}")
+    display_terms = list(video_terms)
+    search_terms = _stock_search_terms_for_online_source(video_terms, params)
+    if search_terms != display_terms:
+        params.video_terms = display_terms
 
-    if not video_terms:
+    logger.debug(f"video terms: {utils.to_json(search_terms)}")
+
+    if not search_terms:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
         logger.error("failed to generate video terms.")
         return None
 
-    return video_terms
+    return search_terms
 
 
 def _parse_srt_time(time_value: str) -> float | None:
@@ -236,7 +439,7 @@ def _parse_srt_time_range(time_range: str) -> tuple[float, float] | None:
     return start_time, end_time
 
 
-def build_matched_segments(video_script, video_terms, subtitle_path):
+def build_matched_segments(video_script, video_terms, subtitle_path, display_terms=None):
     if not subtitle_path:
         return []
 
@@ -248,6 +451,9 @@ def build_matched_segments(video_script, video_terms, subtitle_path):
     terms = _normalize_video_terms(video_terms)
     if isinstance(terms, str):
         terms = []
+    visible_terms = _normalize_video_terms(display_terms)
+    if isinstance(visible_terms, str):
+        visible_terms = []
 
     matched_segments = []
     for item_index, subtitle_item in enumerate(subtitle_items):
@@ -268,12 +474,18 @@ def build_matched_segments(video_script, video_terms, subtitle_path):
             term = terms[-1]
         else:
             term = text
+        display_term = ""
+        if item_index < len(visible_terms):
+            display_term = visible_terms[item_index]
+        elif visible_terms:
+            display_term = visible_terms[-1]
 
         matched_segments.append(
             {
                 "index": len(matched_segments) + 1,
                 "text": text,
                 "term": term,
+                "display_term": display_term or term,
                 "start": round(start_time, 3),
                 "end": round(end_time, 3),
                 "duration": round(end_time - start_time, 3),
@@ -301,11 +513,51 @@ def save_script_data(
     }
     if matched_segments is not None:
         script_data["matched_segments"] = matched_segments
+    preproduction_plan = getattr(params, "preproduction_plan", None)
+    if preproduction_plan:
+        script_data["preproduction_plan"] = preproduction_plan
     if extra:
         script_data.update(extra)
 
     with open(script_file, "w", encoding="utf-8") as f:
         f.write(utils.to_json(script_data))
+    if preproduction_plan:
+        preproduction_file = path.join(utils.task_dir(task_id), "preproduction_plan.json")
+        with open(preproduction_file, "w", encoding="utf-8") as f:
+            f.write(utils.to_json(preproduction_plan))
+
+
+def _apply_preproduction_plan_to_segments(matched_segments, params):
+    plan = getattr(params, "preproduction_plan", None)
+    if not matched_segments or not isinstance(plan, dict):
+        return matched_segments
+
+    row_by_index = preproduction.segment_plan_by_index(plan)
+    updated_segments = []
+    for segment in matched_segments:
+        segment_info = dict(segment)
+        segment_index = int(segment_info.get("index") or len(updated_segments) + 1)
+        row = row_by_index.get(segment_index)
+        if row:
+            material_query = str(row.get("material_query") or "").strip()
+            keyword_cn = str(row.get("keyword_cn") or "").strip()
+            if material_query:
+                segment_info["term"] = material_query
+            if keyword_cn:
+                segment_info["display_term"] = keyword_cn
+            segment_info["title"] = str(row.get("title") or "")
+            segment_info["providers"] = preproduction.normalize_provider_list(
+                row.get("providers")
+            )
+            segment_info["source_urls"] = preproduction.normalize_source_urls(
+                row.get("source_urls")
+            )
+            segment_info["preferred_orientation"] = str(
+                row.get("preferred_orientation") or ""
+            )
+            segment_info["notes"] = str(row.get("notes") or "")
+        updated_segments.append(segment_info)
+    return updated_segments
 
 
 def _read_script_data(task_id):
@@ -324,7 +576,7 @@ def _coerce_video_params(raw_params):
     return VideoParams(**raw_params)
 
 
-def _write_audio_segment_files(task_id, audio_file, matched_segments):
+def _write_audio_segment_files(task_id, audio_file, matched_segments, voice_rate=None):
     from pydub import AudioSegment
 
     voice._configure_pydub_ffmpeg(AudioSegment)
@@ -350,11 +602,14 @@ def _write_audio_segment_files(task_id, audio_file, matched_segments):
         pause_before_ms = max(0, start_ms - previous_end_ms)
         previous_end_ms = max(previous_end_ms, end_ms)
 
-        segment_info["audio_segment"] = {
+        audio_segment = {
             "file": segment_audio_path,
             "pause_before": round(pause_before_ms / 1000, 3),
             "original_text": segment_info.get("text", ""),
         }
+        if voice_rate is not None:
+            audio_segment["voice_rate"] = float(voice_rate)
+        segment_info["audio_segment"] = audio_segment
         updated_segments.append(segment_info)
 
     audio_tail_pause = max(0, len(source_audio) - previous_end_ms) / 1000
@@ -666,7 +921,7 @@ def _cleanup_final_only_artifacts(
 
 
 def _materialize_remote_candidate(candidate: dict, task_id: str, url_to_path: dict) -> str:
-    material_path = candidate.get("material") or ""
+    material_path = candidate.get("material") or candidate.get("cached_path") or ""
     if material_path and not material_path.startswith(("http://", "https://")):
         if path.exists(material_path):
             return material_path
@@ -746,8 +1001,6 @@ def _prepare_candidates_from_timeline(
     matched_segments,
     progress_callback=None,
 ):
-    if params.video_source != "pexels":
-        raise ValueError("candidate editor currently supports Pexels only.")
     if not matched_segments:
         raise ValueError(
             "candidate editor needs a valid subtitle timeline. Enable subtitles and TTS."
@@ -755,7 +1008,7 @@ def _prepare_candidates_from_timeline(
 
     _emit_progress(progress_callback, 0.35, "正在切分每句音频...")
     matched_segments, audio_tail_pause = _write_audio_segment_files(
-        task_id, audio_file, matched_segments
+        task_id, audio_file, matched_segments, voice_rate=params.voice_rate
     )
 
     def _candidate_progress(current: int, total: int, message: str):
@@ -769,7 +1022,7 @@ def _prepare_candidates_from_timeline(
     _, matched_segments = material.download_candidate_videos_for_segments(
         task_id=task_id,
         segments=matched_segments,
-        source="pexels",
+        source=params.video_source or "pexels",
         video_aspect=params.video_aspect,
         max_clip_duration=params.video_clip_duration,
         candidates_per_segment=3,
@@ -778,7 +1031,7 @@ def _prepare_candidates_from_timeline(
     first_segment = matched_segments[0] if matched_segments else {}
     if not first_segment.get("candidates"):
         raise ValueError(
-            "Pexels returned no candidate videos for the first sentence. "
+            "No candidate videos were returned for the first sentence. "
             "Try a clearer first keyword."
         )
 
@@ -821,7 +1074,7 @@ def _prepare_candidates_from_timeline(
     return kwargs
 
 
-def _render_selection_impl(task_id, selections, progress_callback=None):
+def _render_selection_impl(task_id, selections, progress_callback=None, voice_rate=None):
     logger.info(f"rendering selected candidates for task: {task_id}")
     selections = [_selection_to_dict(selection) for selection in selections]
     if not selections:
@@ -830,6 +1083,10 @@ def _render_selection_impl(task_id, selections, progress_callback=None):
 
     script_data = _read_script_data(task_id)
     params = _coerce_video_params(script_data.get("params") or {})
+    saved_voice_rate = float(params.voice_rate or 1.0)
+    voice_rate_override = voice_rate is not None
+    if voice_rate_override:
+        params.voice_rate = float(voice_rate)
     params.match_materials_to_script = True
     params.video_concat_mode = VideoConcatMode.sequential.value
     params.video_transition_mode = None
@@ -970,8 +1227,16 @@ def _render_selection_impl(task_id, selections, progress_callback=None):
         selected_text = (segment.get("text") or "").strip()
         original_segment_file = audio_segment_info.get("file", "")
         segment_audio_file = original_segment_file
+        segment_voice_rate = audio_segment_info.get("voice_rate", saved_voice_rate)
+        try:
+            segment_voice_rate = float(segment_voice_rate)
+        except (TypeError, ValueError):
+            segment_voice_rate = saved_voice_rate
+        voice_rate_changed = voice_rate_override and abs(
+            segment_voice_rate - float(params.voice_rate or 1.0)
+        ) > 0.001
 
-        if selected_text != original_text:
+        if selected_text != original_text or voice_rate_changed:
             segment_audio_file = path.join(
                 edited_audio_dir, f"segment-{segment_index:03d}.mp3"
             )
@@ -1009,6 +1274,7 @@ def _render_selection_impl(task_id, selections, progress_callback=None):
             "file": segment_audio_file,
             "pause_before": round(pause_before, 3),
             "original_text": selected_text,
+            "voice_rate": float(params.voice_rate or 1.0),
         }
         edited_segments.append(edited_segment)
         _emit_progress(
@@ -1099,9 +1365,11 @@ def _render_selection_impl(task_id, selections, progress_callback=None):
     return kwargs
 
 
-def render_selection(task_id, selections, progress_callback=None):
+def render_selection(task_id, selections, progress_callback=None, voice_rate=None):
     try:
-        return _render_selection_impl(task_id, selections, progress_callback)
+        return _render_selection_impl(
+            task_id, selections, progress_callback, voice_rate=voice_rate
+        )
     except Exception as exc:
         logger.exception(f"failed to render selected candidates: {str(exc)}")
         sm.state.update_task(
@@ -1189,6 +1457,10 @@ def start(task_id, params: VideoParams, stop_at: str = "video", progress_callbac
             video_script=video_script,
             video_terms=video_terms,
             subtitle_path=subtitle_path,
+            display_terms=params.video_terms,
+        )
+        matched_segments = _apply_preproduction_plan_to_segments(
+            matched_segments, params
         )
         if not matched_segments:
             logger.warning(
@@ -1209,7 +1481,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video", progress_callbac
 
     if stop_at == "candidates":
         try:
-            params.video_source = "pexels"
+            params.video_source = params.video_source or "pexels"
             params.match_materials_to_script = True
             params.video_concat_mode = VideoConcatMode.sequential.value
             params.video_transition_mode = None

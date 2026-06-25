@@ -60,7 +60,16 @@ class MaterialInfo:
     score: float = 0.0
     relevance_score: float = 0.0
     quality_score: float = 0.0
+    orientation: str = ""
+    orientation_label: str = ""
+    group_rank: int = 0
+    is_default_group: bool = False
     reason: str = ""
+    author: str = ""
+    tweet_id: str = ""
+    media_type: str = ""
+    attribution: str = ""
+    cached_path: str = ""
 
 
 class VideoParams(BaseModel):
@@ -92,6 +101,7 @@ class VideoParams(BaseModel):
     video_materials: Optional[List[MaterialInfo]] = (
         None  # Materials used to generate the video
     )
+    preproduction_plan: Optional[dict[str, Any]] = None
     
     custom_audio_file: Optional[str] = None  # Custom audio file path, will ignore video_script and disable subtitle
     video_language: Optional[str] = ""  # auto detect

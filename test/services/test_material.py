@@ -277,25 +277,36 @@ class TestMaterialTlsVerification(unittest.TestCase):
 
     def test_download_candidate_videos_for_segments_keeps_three_remote_candidates_per_sentence(self):
         """
-        编辑器候选准备阶段要为每句最多返回 3 条远程候选，优先避免重复 URL；
+        编辑器候选准备阶段要为每句返回竖屏/横屏各 3 条远程候选，优先避免重复 URL；
         如果后续句子完全搜不到，则复用上一句候选并标记 fallback。
         """
         shared = "https://v.example/shared.mp4"
         search_results = {
-            "opening": [
+            ("opening", "portrait"): [
                 material.MaterialInfo(provider="pexels", url=shared, duration=6),
                 material.MaterialInfo(provider="pexels", url="https://v.example/a2.mp4", duration=6),
                 material.MaterialInfo(provider="pexels", url="https://v.example/a3.mp4", duration=6),
             ],
-            "middle": [
+            ("opening", "landscape"): [
+                material.MaterialInfo(provider="pexels", url="https://v.example/a4.mp4", duration=6),
+                material.MaterialInfo(provider="pexels", url="https://v.example/a5.mp4", duration=6),
+                material.MaterialInfo(provider="pexels", url="https://v.example/a6.mp4", duration=6),
+            ],
+            ("middle", "portrait"): [
                 material.MaterialInfo(provider="pexels", url=shared, duration=6),
                 material.MaterialInfo(provider="pexels", url="https://v.example/b2.mp4", duration=6),
                 material.MaterialInfo(provider="pexels", url="https://v.example/b3.mp4", duration=6),
             ],
-            "missing": [],
+            ("middle", "landscape"): [
+                material.MaterialInfo(provider="pexels", url="https://v.example/b4.mp4", duration=6),
+                material.MaterialInfo(provider="pexels", url="https://v.example/b5.mp4", duration=6),
+                material.MaterialInfo(provider="pexels", url="https://v.example/b6.mp4", duration=6),
+            ],
+            ("missing", "portrait"): [],
+            ("missing", "landscape"): [],
         }
         def fake_search(search_term, minimum_duration, video_aspect, **kwargs):
-            return search_results[search_term]
+            return search_results[(search_term, material.VideoAspect(video_aspect).name)]
 
         segments = [
             {"index": 1, "term": "opening", "duration": 3, "material": ""},
@@ -316,13 +327,19 @@ class TestMaterialTlsVerification(unittest.TestCase):
 
         self.assertEqual(paths, [])
         save_video.assert_not_called()
-        self.assertEqual(len(matched_segments[0]["candidates"]), 3)
-        self.assertEqual(len(matched_segments[1]["candidates"]), 3)
-        self.assertEqual(len(matched_segments[2]["candidates"]), 3)
+        self.assertEqual(len(matched_segments[0]["candidates"]), 6)
+        self.assertEqual(len(matched_segments[1]["candidates"]), 6)
+        self.assertEqual(len(matched_segments[2]["candidates"]), 6)
         self.assertEqual(matched_segments[0]["candidates"][0]["candidate_id"], "seg-1-cand-1")
         self.assertEqual(matched_segments[1]["candidates"][0]["source_url"], "https://v.example/b2.mp4")
         self.assertEqual(matched_segments[1]["candidates"][0]["preview_url"], "https://v.example/b2.mp4")
         self.assertEqual(matched_segments[0]["candidates"][0]["material"], "")
+        self.assertEqual(matched_segments[0]["candidates"][0]["orientation"], "portrait")
+        self.assertEqual(matched_segments[0]["candidates"][0]["orientation_label"], "竖屏")
+        self.assertEqual(matched_segments[0]["candidates"][0]["group_rank"], 1)
+        self.assertTrue(matched_segments[0]["candidates"][0]["is_default_group"])
+        self.assertEqual(matched_segments[0]["candidates"][3]["orientation"], "landscape")
+        self.assertFalse(matched_segments[0]["candidates"][3]["is_default_group"])
         self.assertIn("score", matched_segments[0]["candidates"][0])
         self.assertIn("quality_score", matched_segments[0]["candidates"][0])
         self.assertIn("relevance_score", matched_segments[0]["candidates"][0])
@@ -333,24 +350,26 @@ class TestMaterialTlsVerification(unittest.TestCase):
         self.assertEqual(matched_segments[0]["preview_url"], shared)
         self.assertTrue(all(candidate["fallback"] for candidate in matched_segments[2]["candidates"]))
 
-    def test_candidate_search_uses_first_ten_candidates(self):
-        search_results = [
-            material.MaterialInfo(
-                provider="pexels",
-                url=f"https://v.example/{index}.mp4",
-                duration=6,
-                width=1920,
-                height=1080,
-                source_page_url=f"https://pexels.com/video/{index}",
-            )
-            for index in range(25)
-        ]
+    def test_candidate_search_uses_first_ten_portrait_and_landscape_candidates(self):
+        calls = []
 
         def fake_search(search_term, minimum_duration, video_aspect, **kwargs):
+            orientation = material.VideoAspect(video_aspect).name
+            calls.append((orientation, kwargs))
             self.assertFalse(kwargs["exact_resolution"])
-            self.assertFalse(kwargs["use_orientation_filter"])
+            self.assertTrue(kwargs["use_orientation_filter"])
             self.assertEqual(kwargs["per_page"], 10)
-            return search_results
+            return [
+                material.MaterialInfo(
+                    provider="pexels",
+                    url=f"https://v.example/{orientation}-{index}.mp4",
+                    duration=6,
+                    width=1080 if orientation == "portrait" else 1920,
+                    height=1920 if orientation == "portrait" else 1080,
+                    source_page_url=f"https://pexels.com/video/{orientation}-{index}",
+                )
+                for index in range(25)
+            ]
 
         with patch.object(material, "search_videos_pexels", side_effect=fake_search):
             _, matched_segments = material.download_candidate_videos_for_segments(
@@ -360,44 +379,71 @@ class TestMaterialTlsVerification(unittest.TestCase):
                 max_clip_duration=3,
             )
 
-        candidate_urls = {
-            candidate["source_url"] for candidate in matched_segments[0]["candidates"]
-        }
-        self.assertTrue(candidate_urls)
-        self.assertTrue(
-            candidate_urls.issubset({f"https://v.example/{index}.mp4" for index in range(10)})
+        self.assertEqual([call[0] for call in calls], ["portrait", "landscape"])
+        candidates = matched_segments[0]["candidates"]
+        self.assertEqual(len(candidates), 6)
+        self.assertEqual(
+            [candidate["orientation"] for candidate in candidates],
+            ["portrait", "portrait", "portrait", "landscape", "landscape", "landscape"],
         )
+        candidate_urls = {candidate["source_url"] for candidate in candidates}
+        first_ten_urls = {
+            f"https://v.example/{orientation}-{index}.mp4"
+            for orientation in ("portrait", "landscape")
+            for index in range(10)
+        }
+        self.assertTrue(candidate_urls.issubset(first_ten_urls))
 
     def test_rule_based_ranking_prefers_keyword_specific_metadata(self):
-        search_results = [
-            material.MaterialInfo(
-                provider="pexels",
-                url="https://v.example/generic-beijing-city.mp4",
-                duration=6,
-                width=3840,
-                height=2160,
-                source_page_url="https://www.pexels.com/video/beijing-city-skyline-1/",
-            ),
-            material.MaterialInfo(
-                provider="pexels",
-                url="https://v.example/tiananmen-square.mp4",
-                duration=6,
-                width=1280,
-                height=720,
-                source_page_url="https://www.pexels.com/video/beijing-tiananmen-square-2/",
-            ),
-            material.MaterialInfo(
-                provider="pexels",
-                url="https://v.example/street-food.mp4",
-                duration=6,
-                width=1920,
-                height=1080,
-                source_page_url="https://www.pexels.com/video/beijing-street-market-3/",
-            ),
-        ]
+        search_results = {
+            "portrait": [
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/generic-beijing-city.mp4",
+                    duration=6,
+                    width=1080,
+                    height=1920,
+                    source_page_url="https://www.pexels.com/video/beijing-city-skyline-1/",
+                ),
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/tiananmen-square.mp4",
+                    duration=6,
+                    width=1080,
+                    height=1920,
+                    source_page_url="https://www.pexels.com/video/beijing-tiananmen-square-2/",
+                ),
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/street-food.mp4",
+                    duration=6,
+                    width=1080,
+                    height=1920,
+                    source_page_url="https://www.pexels.com/video/beijing-street-market-3/",
+                ),
+            ],
+            "landscape": [
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/generic-landscape.mp4",
+                    duration=6,
+                    width=1920,
+                    height=1080,
+                    source_page_url="https://www.pexels.com/video/beijing-skyline-4/",
+                ),
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/tiananmen-landscape.mp4",
+                    duration=6,
+                    width=1920,
+                    height=1080,
+                    source_page_url="https://www.pexels.com/video/beijing-tiananmen-square-5/",
+                ),
+            ],
+        }
 
         def fake_search(search_term, minimum_duration, video_aspect, **kwargs):
-            return search_results
+            return search_results[material.VideoAspect(video_aspect).name]
 
         with patch.object(material, "search_videos_pexels", side_effect=fake_search):
             _, matched_segments = material.download_candidate_videos_for_segments(
@@ -418,6 +464,78 @@ class TestMaterialTlsVerification(unittest.TestCase):
         self.assertEqual(candidates[0]["source_url"], "https://v.example/tiananmen-square.mp4")
         self.assertGreater(candidates[0]["keyword_score"], candidates[1]["keyword_score"])
         self.assertIn("tiananmen", candidates[0]["reason"])
+        self.assertEqual(candidates[0]["orientation"], "portrait")
+        self.assertTrue(candidates[0]["is_default_group"])
+        self.assertEqual(candidates[3]["source_url"], "https://v.example/tiananmen-landscape.mp4")
+        self.assertEqual(candidates[3]["orientation"], "landscape")
+        self.assertFalse(candidates[3]["is_default_group"])
+
+    def test_rule_based_ranking_prioritizes_place_over_visual_keyword(self):
+        search_results = {
+            "portrait": [
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/skylight-window.mp4",
+                    duration=6,
+                    width=1080,
+                    height=1920,
+                    source_page_url="https://www.pexels.com/video/skylight-window-roof-1/",
+                ),
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/guangzhou-city.mp4",
+                    duration=6,
+                    width=1080,
+                    height=1920,
+                    source_page_url="https://www.pexels.com/video/guangzhou-city-skyline-2/",
+                ),
+            ],
+            "landscape": [
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/skylight-landscape.mp4",
+                    duration=6,
+                    width=1920,
+                    height=1080,
+                    source_page_url="https://www.pexels.com/video/modern-skylight-building-3/",
+                ),
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/canton-landscape.mp4",
+                    duration=6,
+                    width=1920,
+                    height=1080,
+                    source_page_url="https://www.pexels.com/video/canton-tower-guangzhou-4/",
+                ),
+            ],
+        }
+
+        def fake_search(search_term, minimum_duration, video_aspect, **kwargs):
+            return search_results[material.VideoAspect(video_aspect).name]
+
+        with patch.object(material, "search_videos_pexels", side_effect=fake_search):
+            _, matched_segments = material.download_candidate_videos_for_segments(
+                task_id="candidate-place-priority",
+                segments=[
+                    {
+                        "index": 1,
+                        "term": "Guangdong skylight",
+                        "text": "广东城市天际线",
+                        "duration": 3,
+                    }
+                ],
+                source="pexels",
+                max_clip_duration=3,
+            )
+
+        candidates = matched_segments[0]["candidates"]
+        self.assertEqual(candidates[0]["source_url"], "https://v.example/guangzhou-city.mp4")
+        self.assertGreater(candidates[0]["keyword_score"], candidates[1]["keyword_score"])
+        self.assertIn("place match", candidates[0]["reason"])
+        first_landscape = next(
+            candidate for candidate in candidates if candidate["orientation"] == "landscape"
+        )
+        self.assertEqual(first_landscape["source_url"], "https://v.example/canton-landscape.mp4")
 
     def test_thumbnail_visual_score_handles_quality_range(self):
         normal = Image.effect_noise((160, 90), 55).convert("RGB")
@@ -440,7 +558,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
 
     def test_thumbnail_scoring_failure_falls_back_to_metadata(self):
         search_results = {
-            "Beijing Tiananmen Square": [
+            ("Beijing Tiananmen Square", "portrait"): [
                 material.MaterialInfo(
                     provider="pexels",
                     url="https://v.example/tiananmen-square.mp4",
@@ -458,11 +576,21 @@ class TestMaterialTlsVerification(unittest.TestCase):
                     height=1080,
                     source_page_url="https://www.pexels.com/video/city/",
                 ),
-            ]
+            ],
+            ("Beijing Tiananmen Square", "landscape"): [
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/tiananmen-landscape.mp4",
+                    duration=6,
+                    width=1920,
+                    height=1080,
+                    source_page_url="https://www.pexels.com/video/beijing-tiananmen-square-landscape/",
+                ),
+            ],
         }
 
         def fake_search(search_term, minimum_duration, video_aspect, **kwargs):
-            return search_results[search_term]
+            return search_results[(search_term, material.VideoAspect(video_aspect).name)]
 
         with (
             patch.object(material, "search_videos_pexels", side_effect=fake_search),
@@ -482,6 +610,48 @@ class TestMaterialTlsVerification(unittest.TestCase):
         self.assertEqual(candidates[0]["visual_score"], 50.0)
         self.assertGreater(candidates[0]["score"], 0)
 
+    def test_candidate_default_group_follows_output_aspect(self):
+        def fake_search(search_term, minimum_duration, video_aspect, **kwargs):
+            orientation = material.VideoAspect(video_aspect).name
+            return [
+                material.MaterialInfo(
+                    provider="pexels",
+                    url=f"https://v.example/{orientation}-{index}.mp4",
+                    duration=6,
+                    width=1080 if orientation == "portrait" else 1920,
+                    height=1920 if orientation == "portrait" else 1080,
+                    source_page_url=f"https://www.pexels.com/video/{orientation}-{index}/",
+                )
+                for index in range(3)
+            ]
+
+        cases = [
+            (material.VideoAspect.portrait, "portrait"),
+            (material.VideoAspect.landscape, "landscape"),
+            (material.VideoAspect.square, "portrait"),
+        ]
+        for video_aspect, expected_default in cases:
+            with self.subTest(video_aspect=video_aspect):
+                with patch.object(material, "search_videos_pexels", side_effect=fake_search):
+                    _, matched_segments = material.download_candidate_videos_for_segments(
+                        task_id="candidate-default-group",
+                        segments=[{"index": 1, "term": "city", "duration": 3}],
+                        source="pexels",
+                        video_aspect=video_aspect,
+                        max_clip_duration=3,
+                    )
+
+                default_orientations = {
+                    candidate["orientation"]
+                    for candidate in matched_segments[0]["candidates"]
+                    if candidate["is_default_group"]
+                }
+                self.assertEqual(default_orientations, {expected_default})
+                self.assertEqual(
+                    matched_segments[0]["candidates"][0]["orientation"],
+                    expected_default,
+                )
+
     def test_candidate_preparation_for_many_segments_does_not_call_codex(self):
         segments = [
             {"index": index + 1, "term": f"landmark {index}", "duration": 3}
@@ -489,14 +659,15 @@ class TestMaterialTlsVerification(unittest.TestCase):
         ]
 
         def fake_search(search_term, minimum_duration, video_aspect, **kwargs):
+            orientation = material.VideoAspect(video_aspect).name
             return [
                 material.MaterialInfo(
                     provider="pexels",
-                    url=f"https://v.example/{search_term.replace(' ', '-')}-{index}.mp4",
+                    url=f"https://v.example/{orientation}-{search_term.replace(' ', '-')}-{index}.mp4",
                     duration=6,
-                    width=1280 + index,
-                    height=720,
-                    source_page_url=f"https://www.pexels.com/video/{search_term.replace(' ', '-')}-{index}/",
+                    width=1080 if orientation == "portrait" else 1920,
+                    height=1920 if orientation == "portrait" else 1080,
+                    source_page_url=f"https://www.pexels.com/video/{orientation}-{search_term.replace(' ', '-')}-{index}/",
                 )
                 for index in range(10)
             ]
@@ -522,9 +693,59 @@ class TestMaterialTlsVerification(unittest.TestCase):
         self.assertEqual(len(matched_segments), 20)
         self.assertEqual(
             sum(len(segment["candidates"]) for segment in matched_segments),
-            60,
+            120,
         )
         codex_response.assert_not_called()
+
+    def test_x_candidates_are_cached_and_preserve_attribution(self):
+        x_item = material.MaterialInfo(
+            provider="x",
+            url="https://video.twimg.com/guangzhou.mp4",
+            duration=8,
+            width=1280,
+            height=720,
+            source_page_url="https://x.com/citycam/status/123",
+            author="citycam",
+            tweet_id="123",
+            media_type="video",
+            attribution="X citycam",
+        )
+
+        with (
+            patch.object(material, "search_videos_x", return_value=[x_item]) as search_x,
+            patch.object(
+                material,
+                "save_video",
+                return_value="/tmp/x-cache/guangzhou.mp4",
+            ) as save_video,
+        ):
+            _, matched_segments = material.download_candidate_videos_for_segments(
+                task_id="candidate-x-cache",
+                segments=[
+                    {
+                        "index": 1,
+                        "term": "Guangzhou skyline",
+                        "duration": 3,
+                        "providers": ["x"],
+                    }
+                ],
+                source="pexels",
+                max_clip_duration=3,
+            )
+
+        search_x.assert_called_once()
+        save_video.assert_called_once()
+        candidates = matched_segments[0]["candidates"]
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["provider"], "x")
+        self.assertEqual(candidates[0]["material"], "/tmp/x-cache/guangzhou.mp4")
+        self.assertEqual(candidates[0]["cached_path"], "/tmp/x-cache/guangzhou.mp4")
+        self.assertEqual(candidates[0]["preview_url"], "/tmp/x-cache/guangzhou.mp4")
+        self.assertEqual(candidates[0]["source_url"], "https://video.twimg.com/guangzhou.mp4")
+        self.assertEqual(candidates[0]["source_page_url"], "https://x.com/citycam/status/123")
+        self.assertEqual(candidates[0]["author"], "citycam")
+        self.assertEqual(candidates[0]["tweet_id"], "123")
+        self.assertEqual(candidates[0]["attribution"], "X citycam")
 
 
 class TestCoverrProvider(unittest.TestCase):

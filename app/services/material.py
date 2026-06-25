@@ -15,12 +15,21 @@ from PIL import Image
 
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
+from app.services import x_material
 from app.utils import utils
 
 # Thread-safe counter for API key rotation
 _api_key_counter = 0
 _api_key_lock = threading.Lock()
 _CANDIDATE_SEARCH_LIMIT = 10
+_CANDIDATE_GROUP_SIZE = 3
+_CANDIDATE_ORIENTATIONS = (
+    ("portrait", VideoAspect.portrait),
+    ("landscape", VideoAspect.landscape),
+)
+_ORIENTATION_LABELS = {"portrait": "竖屏", "landscape": "横屏"}
+_CANDIDATE_PROVIDER_FALLBACK = ("pexels",)
+_SUPPORTED_CANDIDATE_PROVIDERS = {"x", "pexels", "pixabay", "coverr", "url"}
 _DEFAULT_THUMBNAIL_TIMEOUT = 1.0
 _MAX_THUMBNAIL_TIMEOUT = 10.0
 _STOPWORDS = {
@@ -36,6 +45,38 @@ _STOPWORDS = {
     "the",
     "this",
     "with",
+}
+_VISUAL_ATTRIBUTE_TOKENS = {
+    "aerial",
+    "architecture",
+    "building",
+    "buildings",
+    "city",
+    "cityscape",
+    "downtown",
+    "drone",
+    "landmark",
+    "night",
+    "skylight",
+    "skyline",
+    "street",
+    "timelapse",
+    "tower",
+    "travel",
+    "urban",
+    "view",
+}
+_PLACE_TOKEN_ALIASES = {
+    "guangdong": {"guangdong", "guangzhou", "canton", "shenzhen", "pearl river"},
+    "guangzhou": {"guangzhou", "canton", "canton tower", "pearl river"},
+    "canton": {"canton", "guangzhou", "canton tower"},
+    "beijing": {"beijing", "tiananmen", "tiananmen square", "forbidden city"},
+    "tiananmen": {"tiananmen", "tiananmen square"},
+    "shanghai": {"shanghai", "lujiazui", "huangpu river"},
+    "lujiazui": {"lujiazui", "shanghai"},
+    "chongqing": {"chongqing", "mountain city"},
+    "shenzhen": {"shenzhen", "futian"},
+    "futian": {"futian", "shenzhen"},
 }
 
 
@@ -98,6 +139,23 @@ def _candidate_thumbnail_timeout() -> float:
         _DEFAULT_THUMBNAIL_TIMEOUT,
     )
     return max(0.1, min(timeout, _MAX_THUMBNAIL_TIMEOUT))
+
+
+def _candidate_orientation_label(orientation: str) -> str:
+    return _ORIENTATION_LABELS.get(str(orientation or ""), str(orientation or ""))
+
+
+def _default_candidate_orientation(video_aspect: VideoAspect) -> str:
+    aspect = VideoAspect(video_aspect)
+    if aspect == VideoAspect.landscape:
+        return "landscape"
+    return "portrait"
+
+
+def _orientation_from_dimensions(width: int, height: int, fallback: str = "") -> str:
+    if width and height:
+        return "landscape" if width > height else "portrait"
+    return fallback
 
 
 def _select_pexels_video_file(
@@ -193,6 +251,14 @@ def search_videos_pexels(
             item.height = _safe_int(selected_video.get("height"))
             item.thumbnail_url = str(v.get("image") or "")
             item.source_page_url = str(v.get("url") or "")
+            item.orientation = (
+                video_orientation
+                if use_orientation_filter
+                else _orientation_from_dimensions(
+                    item.width, item.height, video_orientation
+                )
+            )
+            item.orientation_label = _candidate_orientation_label(item.orientation)
             if item.url:
                 video_items.append(item)
         return video_items
@@ -334,6 +400,30 @@ def search_videos_coverr(
     return []
 
 
+def search_videos_x(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    source_urls: list[str] | None = None,
+) -> List[MaterialInfo]:
+    """
+    Search Twitter/X video media through the external AgentReach CLI adapter.
+
+    X does not expose a stable orientation filter, so orientation is inferred from
+    returned metadata when available and otherwise left to the render pipeline.
+    """
+    del video_aspect
+    try:
+        return x_material.search_x_videos(
+            search_term=search_term,
+            minimum_duration=minimum_duration,
+            source_urls=source_urls or [],
+        )
+    except Exception as exc:
+        logger.warning(f"X video search failed for '{search_term}': {str(exc)}")
+        return []
+
+
 def save_video(video_url: str, save_dir: str = "") -> str:
     if not save_dir:
         save_dir = utils.storage_dir("cache_videos")
@@ -409,6 +499,8 @@ def download_videos(
         search_videos = search_videos_pixabay
     elif source == "coverr":
         search_videos = search_videos_coverr
+    elif source == "x":
+        search_videos = search_videos_x
 
     material_directory = config.app.get("material_directory", "").strip()
     if material_directory == "task":
@@ -490,6 +582,8 @@ def download_videos_for_segments(
         search_videos = search_videos_pixabay
     elif source == "coverr":
         search_videos = search_videos_coverr
+    elif source == "x":
+        search_videos = search_videos_x
 
     material_directory = config.app.get("material_directory", "").strip()
     if material_directory == "task":
@@ -602,6 +696,29 @@ def _keyword_tokens(*parts: str) -> list[str]:
     return tokens
 
 
+def _metadata_contains_term(metadata_text: str, term: str) -> bool:
+    term = re.sub(r"[^a-z0-9]+", " ", (term or "").lower()).strip()
+    if not term:
+        return False
+    return bool(re.search(rf"(^|\s){re.escape(term)}($|\s)", metadata_text or ""))
+
+
+def _matched_token_alias(token: str, metadata_text: str) -> str:
+    aliases = _PLACE_TOKEN_ALIASES.get(token, {token})
+    for alias in sorted(aliases, key=len, reverse=True):
+        if _metadata_contains_term(metadata_text, alias):
+            return alias
+    return ""
+
+
+def _search_token_weight(token: str) -> float:
+    if token in _PLACE_TOKEN_ALIASES:
+        return 2.8
+    if token in _VISUAL_ATTRIBUTE_TOKENS:
+        return 0.7
+    return 1.0
+
+
 def _metadata_relevance_score(
     item: MaterialInfo,
     search_term: str,
@@ -621,27 +738,53 @@ def _metadata_relevance_score(
     if not context_tokens:
         return _clamp_score(65.0 - (original_index * 0.5)), "ranked by source order"
 
-    matched_search = [token for token in search_tokens if token in metadata_text]
-    matched_context = [token for token in context_tokens if token in metadata_text]
-    matched_page = [token for token in search_tokens if token in page_text]
+    matched_search = []
+    matched_context = []
+    matched_page = []
+    place_matches = []
+    matched_search_weight = 0.0
+    total_search_weight = 0.0
+    for token in search_tokens:
+        token_weight = _search_token_weight(token)
+        total_search_weight += token_weight
+        matched_alias = _matched_token_alias(token, metadata_text)
+        if matched_alias:
+            matched_search.append(matched_alias)
+            matched_search_weight += token_weight
+            if token in _PLACE_TOKEN_ALIASES:
+                place_matches.append(matched_alias)
+        page_alias = _matched_token_alias(token, page_text)
+        if page_alias:
+            matched_page.append(page_alias)
+
+    matched_context = [
+        token for token in context_tokens if _matched_token_alias(token, metadata_text)
+    ]
 
     search_coverage = (
-        len(matched_search) / len(search_tokens) if search_tokens else 0.0
+        matched_search_weight / total_search_weight if total_search_weight else 0.0
     )
     context_coverage = len(matched_context) / len(context_tokens)
     phrase_bonus = 14.0 if phrase and phrase in metadata_text else 0.0
     page_bonus = min(len(matched_page) * 4.0, 12.0)
+    place_bonus = min(len(place_matches) * 18.0, 28.0)
+    has_place_token = any(token in _PLACE_TOKEN_ALIASES for token in search_tokens)
+    place_penalty = 22.0 if has_place_token and not place_matches else 0.0
     order_bonus = max(0.0, 8.0 - (original_index * 0.35))
     score = (
-        28.0
-        + (search_coverage * 42.0)
-        + (context_coverage * 14.0)
+        24.0
+        + (search_coverage * 44.0)
+        + (context_coverage * 12.0)
         + phrase_bonus
         + page_bonus
+        + place_bonus
         + order_bonus
+        - place_penalty
     )
 
-    if matched_search:
+    if place_matches:
+        reason = f"place match on {', '.join(place_matches[:3])}"
+    elif matched_search:
         reason = f"matches {', '.join(matched_search[:3])} metadata"
     elif matched_context:
         reason = f"context match on {', '.join(matched_context[:3])}"
@@ -833,6 +976,68 @@ def _dedupe_video_items(video_items: List[MaterialInfo]) -> List[MaterialInfo]:
     return deduped_items
 
 
+def _candidate_provider_list(segment: dict, source: str) -> list[str]:
+    raw_providers = segment.get("providers")
+    if isinstance(raw_providers, str):
+        provider_values = re.split(r"[,，;；|/]+", raw_providers)
+    elif isinstance(raw_providers, list):
+        provider_values = raw_providers
+    else:
+        provider_values = [source]
+
+    providers = []
+    for provider in provider_values:
+        provider_name = str(provider or "").strip().lower()
+        if provider_name == "twitter":
+            provider_name = "x"
+        if provider_name == "mixed":
+            provider_name = "pexels"
+        if provider_name in _SUPPORTED_CANDIDATE_PROVIDERS and provider_name not in providers:
+            providers.append(provider_name)
+    return providers or list(_CANDIDATE_PROVIDER_FALLBACK)
+
+
+def _source_urls_for_segment(segment: dict) -> list[str]:
+    raw_urls = segment.get("source_urls") or []
+    if isinstance(raw_urls, str):
+        raw_urls = re.split(r"[\n,，;；]+", raw_urls)
+    urls = []
+    for raw_url in raw_urls:
+        url = str(raw_url or "").strip()
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _looks_like_direct_video_url(url: str) -> bool:
+    return bool(
+        re.search(r"\.(mp4|mov|m4v|webm|m3u8)(?:$|[?#])", url or "", re.I)
+        or "video.twimg.com" in (url or "").lower()
+    )
+
+
+def _looks_like_x_page_url(url: str) -> bool:
+    return bool(re.search(r"https?://(?:www\.)?(?:x|twitter)\.com/", url or "", re.I))
+
+
+def _direct_source_video_items(
+    source_urls: list[str],
+    minimum_duration: int,
+) -> list[MaterialInfo]:
+    items = []
+    for url in source_urls:
+        if not _looks_like_direct_video_url(url):
+            continue
+        item = MaterialInfo()
+        item.provider = "url"
+        item.url = url
+        item.duration = float(max(minimum_duration, 1))
+        item.source_page_url = url
+        item.reason = "provided by preproduction source URL"
+        items.append(item)
+    return items
+
+
 def _rank_candidate_items(
     search_term: str,
     segment_text: str,
@@ -889,29 +1094,71 @@ def _candidate_payload_from_record(
     record: dict[str, Any],
     segment_index: int,
     rank: int,
+    orientation: str,
+    group_rank: int,
+    is_default_group: bool,
     fallback: bool = False,
 ) -> dict:
     item: MaterialInfo = record["item"]
+    orientation = orientation or item.orientation or ""
+    cached_path = item.cached_path or ""
+    preview_url = cached_path or item.url
     return {
         "candidate_id": f"seg-{segment_index}-cand-{rank}",
         "rank": rank,
         "provider": item.provider or "pexels",
-        "material": "",
+        "material": cached_path,
         "source_url": item.url,
-        "preview_url": item.url,
+        "preview_url": preview_url,
         "duration": float(item.duration or 0),
         "width": int(item.width or 0),
         "height": int(item.height or 0),
         "thumbnail_url": item.thumbnail_url or "",
         "source_page_url": item.source_page_url or "",
+        "author": item.author or "",
+        "tweet_id": item.tweet_id or "",
+        "media_type": item.media_type or "",
+        "attribution": item.attribution or "",
+        "cached_path": cached_path,
         "score": round(float(record.get("score") or 0.0), 2),
         "relevance_score": round(float(record.get("relevance_score") or 0.0), 2),
         "keyword_score": round(float(record.get("keyword_score") or 0.0), 2),
         "quality_score": round(float(record.get("quality_score") or 0.0), 2),
         "visual_score": round(float(record.get("visual_score") or 0.0), 2),
+        "orientation": orientation,
+        "orientation_label": _candidate_orientation_label(orientation),
+        "group_rank": int(group_rank or 0),
+        "is_default_group": bool(is_default_group),
         "reason": str(record.get("reason") or "").strip(),
         "fallback": fallback,
     }
+
+
+def _cache_x_candidate_records(
+    task_id: str,
+    records: list[dict[str, Any]],
+    segment_index: int,
+):
+    cache_policy = str(config.app.get("x_cache_policy", "task") or "task").strip().lower()
+    if cache_policy not in {"task", "true", "1", "yes"}:
+        return
+
+    cache_dir = os.path.join(utils.task_dir(task_id), "x_materials", f"segment-{segment_index:03d}")
+    for record in records:
+        item = record.get("item")
+        if not isinstance(item, MaterialInfo) or item.provider != "x":
+            continue
+        if item.media_type and item.media_type != "video":
+            continue
+        if item.cached_path and os.path.exists(item.cached_path):
+            continue
+        try:
+            saved_path = save_video(video_url=item.url, save_dir=cache_dir)
+        except Exception as exc:
+            logger.warning(f"failed to cache X candidate video: {item.url}, error: {str(exc)}")
+            saved_path = ""
+        if saved_path:
+            item.cached_path = saved_path
 
 
 def download_candidate_videos_for_segments(
@@ -926,23 +1173,27 @@ def download_candidate_videos_for_segments(
     """
     Prepare multiple remote preview candidates for each subtitle/script segment.
 
-    The first editor version is intentionally Pexels-only so selection metadata can
-    stay predictable. Other providers continue to use the legacy automatic flow.
+    Pexels keeps the portrait/landscape dual-search behavior. CSV manifest rows
+    may override providers per segment, including X via the AgentReach adapter.
     """
-    if source != "pexels":
-        raise ValueError("candidate editor currently supports Pexels only.")
-
-    logger.info("preparing editable Pexels candidates for script segments")
+    logger.info("preparing editable remote candidates for script segments")
 
     updated_segments: List[dict] = []
     used_video_urls = set()
     last_candidates: List[dict] = []
     total_segments = len(segments)
+    default_orientation = _default_candidate_orientation(video_aspect)
 
     for segment_number, segment in enumerate(segments, start=1):
         segment_info = dict(segment)
         segment_index = int(segment_info.get("index") or len(updated_segments) + 1)
         search_term = (segment_info.get("term") or segment_info.get("text") or "").strip()
+        source_urls = _source_urls_for_segment(segment_info)
+        providers = _candidate_provider_list(segment_info, source)
+        if source_urls and "url" not in providers:
+            providers.insert(0, "url")
+        if any(_looks_like_x_page_url(url) for url in source_urls) and "x" not in providers:
+            providers.insert(0, "x")
         if progress_callback:
             progress_callback(
                 segment_number - 1,
@@ -957,41 +1208,155 @@ def download_candidate_videos_for_segments(
                 int(max_clip_duration or math.ceil(segment_duration)),
             ),
         )
-        video_items = []
-        if search_term:
-            video_items = search_videos_pexels(
-                search_term=search_term,
-                minimum_duration=minimum_duration,
-                video_aspect=video_aspect,
-                per_page=_CANDIDATE_SEARCH_LIMIT,
-                exact_resolution=False,
-                use_orientation_filter=False,
-            )
-        logger.info(
-            f"found {len(video_items)} candidate videos for '{search_term}', "
-            f"segment duration: {segment_duration:.2f}s"
-        )
+        ranked_groups: dict[str, List[dict[str, Any]]] = {}
+        for orientation, _ in _CANDIDATE_ORIENTATIONS:
+            ranked_groups[orientation] = []
+
+        for provider in providers:
+            if provider == "pexels":
+                for orientation, orientation_aspect in _CANDIDATE_ORIENTATIONS:
+                    video_items = []
+                    if search_term:
+                        video_items = search_videos_pexels(
+                            search_term=search_term,
+                            minimum_duration=minimum_duration,
+                            video_aspect=orientation_aspect,
+                            per_page=_CANDIDATE_SEARCH_LIMIT,
+                            exact_resolution=False,
+                            use_orientation_filter=True,
+                        )
+                    logger.info(
+                        f"found {len(video_items)} {orientation} {provider} candidate videos for "
+                        f"'{search_term}', segment duration: {segment_duration:.2f}s"
+                    )
+                    ranked_groups[orientation].extend(
+                        _rank_candidate_items(
+                            search_term=search_term,
+                            segment_text=str(segment_info.get("text") or ""),
+                            video_items=video_items,
+                            video_aspect=orientation_aspect,
+                            minimum_duration=minimum_duration,
+                            used_video_urls=used_video_urls,
+                            segment_index=segment_index,
+                            candidates_per_segment=candidates_per_segment,
+                        )
+                    )
+                continue
+
+            if provider == "x":
+                video_items = []
+                if search_term or source_urls:
+                    video_items = search_videos_x(
+                        search_term=search_term,
+                        minimum_duration=minimum_duration,
+                        video_aspect=video_aspect,
+                        source_urls=source_urls,
+                    )
+                logger.info(
+                    f"found {len(video_items)} X candidate videos for "
+                    f"'{search_term}', segment duration: {segment_duration:.2f}s"
+                )
+            elif provider == "url":
+                video_items = _direct_source_video_items(
+                    source_urls=source_urls,
+                    minimum_duration=minimum_duration,
+                )
+                logger.info(
+                    f"found {len(video_items)} direct URL candidate videos for "
+                    f"'{search_term}', segment duration: {segment_duration:.2f}s"
+                )
+            elif provider == "pixabay":
+                video_items = (
+                    search_videos_pixabay(
+                        search_term=search_term,
+                        minimum_duration=minimum_duration,
+                        video_aspect=video_aspect,
+                    )
+                    if search_term
+                    else []
+                )
+                logger.info(f"found {len(video_items)} pixabay candidate videos for '{search_term}'")
+            elif provider == "coverr":
+                video_items = (
+                    search_videos_coverr(
+                        search_term=search_term,
+                        minimum_duration=minimum_duration,
+                        video_aspect=video_aspect,
+                    )
+                    if search_term
+                    else []
+                )
+                logger.info(f"found {len(video_items)} coverr candidate videos for '{search_term}'")
+            else:
+                continue
+
+            provider_groups: dict[str, list[MaterialInfo]] = {
+                orientation: [] for orientation, _ in _CANDIDATE_ORIENTATIONS
+            }
+            for item in video_items:
+                item.orientation = (
+                    item.orientation
+                    or _orientation_from_dimensions(
+                        _safe_int(item.width),
+                        _safe_int(item.height),
+                        default_orientation,
+                    )
+                )
+                if item.orientation not in provider_groups:
+                    item.orientation = default_orientation
+                item.orientation_label = _candidate_orientation_label(item.orientation)
+                provider_groups[item.orientation].append(item)
+
+            for orientation, orientation_aspect in _CANDIDATE_ORIENTATIONS:
+                records = _rank_candidate_items(
+                    search_term=search_term,
+                    segment_text=str(segment_info.get("text") or ""),
+                    video_items=provider_groups.get(orientation, []),
+                    video_aspect=orientation_aspect,
+                    minimum_duration=minimum_duration,
+                    used_video_urls=used_video_urls,
+                    segment_index=segment_index,
+                    candidates_per_segment=candidates_per_segment,
+                )
+                _cache_x_candidate_records(
+                    task_id=task_id,
+                    records=records,
+                    segment_index=segment_index,
+                )
+                ranked_groups[orientation].extend(records)
 
         candidates = []
-        ranked_records = _rank_candidate_items(
-            search_term=search_term,
-            segment_text=str(segment_info.get("text") or ""),
-            video_items=video_items,
-            video_aspect=video_aspect,
-            minimum_duration=minimum_duration,
-            used_video_urls=used_video_urls,
-            segment_index=segment_index,
-            candidates_per_segment=candidates_per_segment,
-        )
-        for rank, record in enumerate(ranked_records, start=1):
-            candidate = _candidate_payload_from_record(
-                record=record,
-                segment_index=segment_index,
-                rank=rank,
-                fallback=False,
-            )
+        ordered_orientations = [default_orientation] + [
+            orientation
+            for orientation, _ in _CANDIDATE_ORIENTATIONS
+            if orientation != default_orientation
+        ]
+        for orientation in ordered_orientations:
+            for group_rank, record in enumerate(
+                sorted(
+                    ranked_groups.get(orientation, []),
+                    key=lambda record: (
+                        -record["score"],
+                        -record["relevance_score"],
+                        -record["quality_score"],
+                        record["original_index"],
+                    ),
+                ),
+                start=1,
+            ):
+                candidate = _candidate_payload_from_record(
+                    record=record,
+                    segment_index=segment_index,
+                    rank=len(candidates) + 1,
+                    orientation=orientation,
+                    group_rank=group_rank,
+                    is_default_group=orientation == default_orientation,
+                    fallback=False,
+                )
+                candidates.append(candidate)
+
+        for candidate in candidates:
             used_video_urls.add(candidate["source_url"])
-            candidates.append(candidate)
 
         if not candidates and last_candidates:
             logger.warning(
@@ -1008,7 +1373,7 @@ def download_candidate_videos_for_segments(
                     "reused previous segment candidate because no new candidates were found"
                 )
                 candidates.append(fallback_candidate)
-                if len(candidates) >= candidates_per_segment:
+                if len(candidates) >= candidates_per_segment * len(_CANDIDATE_ORIENTATIONS):
                     break
 
         if candidates:
@@ -1016,12 +1381,12 @@ def download_candidate_videos_for_segments(
             segment_info["material"] = ""
             segment_info["material_source_url"] = candidates[0]["source_url"]
             segment_info["preview_url"] = candidates[0]["preview_url"]
-            segment_info["provider"] = "pexels"
+            segment_info["provider"] = ",".join(providers)
         else:
             segment_info["material"] = ""
             segment_info["material_source_url"] = ""
             segment_info["preview_url"] = ""
-            segment_info["provider"] = "pexels"
+            segment_info["provider"] = ",".join(providers)
 
         segment_info["candidates"] = candidates
         updated_segments.append(segment_info)

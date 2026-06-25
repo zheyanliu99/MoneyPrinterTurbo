@@ -48,6 +48,16 @@ pixabay_api_keys = []
 # 特别注意格式，Key 用英文双引号括起来，多个Key用逗号隔开
 coverr_api_keys = []
 
+# X/Twitter material provider via external AgentReach. MoneyPrinter Turbo does
+# not vendor AgentReach; it calls this command and lets AgentReach select
+# twitter-cli/OpenCLI according to `agent-reach doctor --json`.
+enable_x_materials = true
+agent_reach_command = "agent-reach"
+x_search_limit = 10
+x_timeout_seconds = 20
+x_cache_policy = "task" # "task" caches top X videos inside each task; "off" keeps remote links only.
+candidate_preview_providers = ["pexels"] # UI default candidate sources; add "x" to include X preview by default.
+
 # 支持的提供商 (Supported providers):
 #   openai
 #   aihubmix   (OpenAI-compatible AI model gateway)
